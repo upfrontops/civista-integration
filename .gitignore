@@ -3,3 +3,4 @@ node_modules/
 /archive/
 /incoming/
 *.log
+validate.sh

@@ -15,7 +15,7 @@ const EXPECTED_HEADERS = {
 // Column name mapping: CSV header -> staging table column
 const COLUMN_MAP = {
   'CIF#': 'cif_number',
-  'CIFNum': 'cifnum',
+  'CIFNum': 'cif_number',
   'FirstName': 'firstname',
   'LastName': 'lastname',
   'FullName': 'fullname',

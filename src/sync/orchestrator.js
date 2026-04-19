@@ -25,7 +25,7 @@ const FILE_TABLE_MAP = {
 
 // Key column used for diff engine per staging table
 const KEY_COLUMNS = {
-  stg_cif: 'cifnum',
+  stg_cif: 'cif_number',
   stg_dda: 'primarykey',
   stg_loans: 'primarykey',
   stg_cd: 'primarykey',
