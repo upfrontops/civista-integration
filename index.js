@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const cron = require('node-cron');
 const multer = require('multer');
-const { pool } = require('./db/init');
+const { pool, initDb } = require('./db/init');
 const { runFullSync } = require('./src/sync/orchestrator');
 const { getHealthStatus } = require('./src/monitoring/health');
 const { startSftpServer } = require('./src/ingestion/sftp-server');
@@ -106,6 +106,14 @@ startSftpServer({
   },
 });
 
-app.listen(port, () => {
-  console.log(`civista-integration listening on port ${port}`);
-});
+// Initialize database tables then start server
+initDb()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`civista-integration listening on port ${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err.message);
+    process.exit(1);
+  });

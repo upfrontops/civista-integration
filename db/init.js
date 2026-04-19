@@ -10,17 +10,7 @@ async function initDb() {
     await client.query('BEGIN');
 
     await client.query(`
-      DROP TABLE IF EXISTS hubspot_id_map CASCADE;
-      DROP TABLE IF EXISTS stg_debit_cards CASCADE;
-      DROP TABLE IF EXISTS stg_cd CASCADE;
-      DROP TABLE IF EXISTS stg_loans CASCADE;
-      DROP TABLE IF EXISTS stg_dda CASCADE;
-      DROP TABLE IF EXISTS stg_cif CASCADE;
-      DROP TABLE IF EXISTS sync_log CASCADE;
-    `);
-
-    await client.query(`
-      CREATE TABLE sync_log (
+      CREATE TABLE IF NOT EXISTS sync_log (
         id SERIAL PRIMARY KEY,
         table_name VARCHAR(50),
         started_at TIMESTAMPTZ,
@@ -37,7 +27,7 @@ async function initDb() {
     `);
 
     await client.query(`
-      CREATE TABLE stg_cif (
+      CREATE TABLE IF NOT EXISTS stg_cif (
         id SERIAL PRIMARY KEY,
         firstname TEXT,
         lastname TEXT,
@@ -85,7 +75,7 @@ async function initDb() {
     `);
 
     await client.query(`
-      CREATE TABLE stg_dda (
+      CREATE TABLE IF NOT EXISTS stg_dda (
         id SERIAL PRIMARY KEY,
         primarykey TEXT,
         acctlast4 TEXT,
@@ -111,7 +101,7 @@ async function initDb() {
     `);
 
     await client.query(`
-      CREATE TABLE stg_loans (
+      CREATE TABLE IF NOT EXISTS stg_loans (
         id SERIAL PRIMARY KEY,
         primarykey TEXT,
         acctlast4 TEXT,
@@ -135,7 +125,7 @@ async function initDb() {
     `);
 
     await client.query(`
-      CREATE TABLE stg_cd (
+      CREATE TABLE IF NOT EXISTS stg_cd (
         id SERIAL PRIMARY KEY,
         primarykey TEXT,
         acctlast4 TEXT,
@@ -158,7 +148,7 @@ async function initDb() {
     `);
 
     await client.query(`
-      CREATE TABLE stg_debit_cards (
+      CREATE TABLE IF NOT EXISTS stg_debit_cards (
         id SERIAL PRIMARY KEY,
         cif_number TEXT,
         acctlast4 TEXT,
@@ -176,7 +166,7 @@ async function initDb() {
     `);
 
     await client.query(`
-      CREATE TABLE hubspot_id_map (
+      CREATE TABLE IF NOT EXISTS hubspot_id_map (
         id SERIAL PRIMARY KEY,
         source_table VARCHAR(50) NOT NULL,
         source_key VARCHAR(255) NOT NULL,

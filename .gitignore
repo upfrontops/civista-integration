@@ -4,3 +4,7 @@ node_modules/
 /incoming/
 *.log
 validate.sh
+
+# PII — never commit banking data
+*.csv
+*.vtt
