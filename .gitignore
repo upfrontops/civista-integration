@@ -1,0 +1,5 @@
+node_modules/
+.env
+/archive/
+/incoming/
+*.log
