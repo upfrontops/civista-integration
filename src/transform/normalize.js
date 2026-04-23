@@ -43,7 +43,7 @@ function normalizeDate(val) {
 
 function normalizeCifContact(row) {
   return {
-    cif_number: row.cifnum,
+    cif_number: row.cif_number,
     firstname: row.firstname || null,
     lastname: row.lastname || null,
     fullname: row.fullname || null,
@@ -69,7 +69,7 @@ function normalizeCifContact(row) {
 
 function normalizeCifCompany(row) {
   return {
-    cif_number: row.cifnum,
+    cif_number: row.cif_number,
     name: row.fullname || null,
     phone: row.phonenumber || null,
     address: row.address1 || null,
@@ -108,7 +108,7 @@ function normalizeDda(row) {
 function normalizeLoan(row) {
   return {
     primary_key: row.primarykey,
-    cif_number: row.cifnum,
+    cif_number: row.cif_number,
     acctlast4: row.acctlast4,
     interest_rate: normalizeNumber(row.interestrate),
     accttype: row.accttype,
@@ -129,7 +129,7 @@ function normalizeLoan(row) {
 function normalizeCd(row) {
   return {
     primary_key: row.primarykey,
-    cif_number: row.cifnum,
+    cif_number: row.cif_number,
     acctlast4: row.acctlast4,
     interest_rate: normalizeNumber(row.interestrate),
     accttype: row.accttype,

@@ -13,10 +13,11 @@ const port = process.env.PORT || 3000;
 
 const INCOMING_DIR = process.env.INCOMING_DIR || path.join(__dirname, 'incoming');
 const ARCHIVE_DIR = process.env.ARCHIVE_DIR || path.join(__dirname, 'archive');
+const QUARANTINE_DIR = process.env.QUARANTINE_DIR || path.join(__dirname, 'quarantine');
 
-// Ensure directories exist
 fs.mkdirSync(INCOMING_DIR, { recursive: true });
 fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
 
 // File upload for manual CSV drops
 const upload = multer({ dest: INCOMING_DIR });
@@ -52,7 +53,7 @@ app.post('/sync', async (req, res) => {
   res.json({ message: 'Sync started', startedAt: new Date().toISOString() });
 
   try {
-    await runFullSync(INCOMING_DIR, ARCHIVE_DIR);
+    await runFullSync(INCOMING_DIR, ARCHIVE_DIR, QUARANTINE_DIR);
   } catch (err) {
     console.error('Sync failed:', err);
   } finally {
@@ -87,7 +88,7 @@ cron.schedule('0 2 * * *', async () => {
   console.log('Cron: starting nightly sync');
   syncRunning = true;
   try {
-    await runFullSync(INCOMING_DIR, ARCHIVE_DIR);
+    await runFullSync(INCOMING_DIR, ARCHIVE_DIR, QUARANTINE_DIR);
   } catch (err) {
     console.error('Cron sync failed:', err);
   } finally {

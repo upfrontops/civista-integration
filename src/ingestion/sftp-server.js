@@ -16,11 +16,19 @@ function startSftpServer(options = {}) {
     return null;
   }
 
+  // Refuse to start with an empty password. An empty SFTP_PASS would accept
+  // any connection from the configured username — an obvious attack vector
+  // for a system ingesting banking records.
+  if (!process.env.SFTP_PASS || process.env.SFTP_PASS.trim() === '') {
+    console.error('SFTP server NOT started: SFTP_PASS is empty or unset. Refusing to run with unauthenticated access.');
+    return null;
+  }
+
   fs.mkdirSync(incomingDir, { recursive: true });
 
   const hostKey = fs.readFileSync(hostKeyPath);
   const allowedUser = process.env.SFTP_USER || 'civista';
-  const allowedPass = process.env.SFTP_PASS || '';
+  const allowedPass = process.env.SFTP_PASS;
 
   const server = new Server({ hostKeys: [hostKey] }, (client) => {
     console.log('SFTP client connected');

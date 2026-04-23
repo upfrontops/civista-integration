@@ -177,6 +177,39 @@ async function initDb() {
       );
     `);
 
+    // Audit ledger: what has been successfully sent to HubSpot.
+    // Replaces the broken synced_at approach. Diff engine uses this as
+    // source of truth for "has this (key, hash) been shipped?"
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS shipped_records (
+        source_table VARCHAR(50) NOT NULL,
+        source_key VARCHAR(255) NOT NULL,
+        row_hash VARCHAR(64) NOT NULL,
+        hubspot_id VARCHAR(50),
+        shipped_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (source_table, source_key)
+      );
+    `);
+
+    // Every failure or quarantine is a first-class row here. Nothing is silent.
+    // error_type values: classification, validation, hubspot_batch, hubspot_record, parse, infra
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sync_errors (
+        id SERIAL PRIMARY KEY,
+        run_id INTEGER,
+        source_table VARCHAR(50),
+        source_key VARCHAR(255),
+        error_type VARCHAR(50) NOT NULL,
+        error_message TEXT,
+        record_snapshot JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_sync_errors_run ON sync_errors(run_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_sync_errors_created ON sync_errors(created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_shipped_hash ON shipped_records(source_table, source_key, row_hash)`);
+
     await client.query('COMMIT');
     console.log('Database initialized: all tables created');
   } catch (err) {

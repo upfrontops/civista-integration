@@ -1,20 +1,21 @@
 const { pool } = require('../../db/init');
 
+/**
+ * Health status. Surfaces:
+ *   - database connectivity
+ *   - last sync per table with shipped/error/skipped counts
+ *   - per-run error counts (from sync_errors)
+ *   - recent unresolved errors (last 20)
+ *   - overall reconciled/unhealthy flag
+ */
 async function getHealthStatus() {
   const client = await pool.connect();
   try {
-    // Last sync per table
     const lastSyncs = await client.query(`
       SELECT DISTINCT ON (table_name)
-        table_name,
-        started_at,
-        completed_at,
-        records_attempted,
-        records_created,
-        records_updated,
-        records_failed,
-        records_skipped,
-        error_details
+        id, table_name, started_at, completed_at,
+        records_attempted, records_created, records_updated,
+        records_failed, records_skipped, error_details, row_count
       FROM sync_log
       ORDER BY table_name, started_at DESC
     `);
@@ -23,24 +24,49 @@ async function getHealthStatus() {
     let hasErrors = false;
 
     for (const row of lastSyncs.rows) {
+      const errs = await client.query(
+        `SELECT error_type, COUNT(*) as c FROM sync_errors WHERE run_id = $1 GROUP BY error_type`,
+        [row.id]
+      );
+      const errCounts = {};
+      let errTotal = 0;
+      for (const e of errs.rows) {
+        errCounts[e.error_type] = parseInt(e.c);
+        errTotal += parseInt(e.c);
+      }
+      if (errTotal > 0 || row.records_failed > 0) hasErrors = true;
+
       tables[row.table_name] = {
-        last_sync: row.completed_at || row.started_at,
+        last_run_id: row.id,
+        started_at: row.started_at,
+        completed_at: row.completed_at,
+        source_row_count: row.row_count,
         records_attempted: row.records_attempted,
-        records_created: row.records_created,
-        records_updated: row.records_updated,
+        records_shipped: row.records_created,
         records_failed: row.records_failed,
         records_skipped: row.records_skipped,
-        errors: row.error_details,
+        errors: { total: errTotal, by_type: errCounts },
+        error_details: row.error_details,
       };
-      if (row.records_failed > 0 || row.error_details) {
-        hasErrors = true;
-      }
     }
+
+    const recentErrors = await client.query(`
+      SELECT id, run_id, source_table, source_key, error_type, error_message, created_at
+      FROM sync_errors
+      ORDER BY created_at DESC
+      LIMIT 20
+    `);
+
+    const quarantineTotal = await client.query(
+      `SELECT COUNT(*) as c FROM sync_errors WHERE error_type IN ('classification','validation','hubspot_record')`
+    );
 
     return {
       status: hasErrors ? 'unhealthy' : 'healthy',
       database: 'connected',
       tables,
+      quarantine_total: parseInt(quarantineTotal.rows[0].c),
+      recent_errors: recentErrors.rows,
     };
   } catch (err) {
     return {

@@ -1,4 +1,3 @@
-const { pool } = require('../../db/init');
 const {
   normalizeCifContact,
   normalizeCifCompany,
@@ -34,7 +33,8 @@ async function hubspotFetch(path, options = {}) {
 
     if (res.status === 429) {
       if (attempt === MAX_RETRIES) {
-        throw new Error(`Rate limited after ${MAX_RETRIES} retries: ${path}`);
+        const retryBody = await res.text().catch(() => '');
+        throw new Error(`Rate limited after ${MAX_RETRIES} retries on ${path}: ${retryBody}`);
       }
       console.log(`Rate limited on ${path}, retrying in ${delay}ms (attempt ${attempt + 1})`);
       await new Promise(r => setTimeout(r, delay));
@@ -42,313 +42,158 @@ async function hubspotFetch(path, options = {}) {
       continue;
     }
 
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`HubSpot API error ${res.status} on ${path}: ${body}`);
-    }
-
-    return res.json();
+    // 2xx: read once and return parsed body + status.
+    // non-2xx: read once, return parsed body + status — caller decides what to do.
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+    return { status: res.status, ok: res.ok, body: parsed };
   }
 }
 
+/**
+ * Preflight validator. Every input MUST have a non-empty idProperty value,
+ * otherwise the batch upsert will either fail opaquely or create orphans.
+ *
+ * Returns { valid, invalid } — invalid rows should be quarantined with a
+ * validation error; only valid rows are sent to HubSpot.
+ */
+function validateBatchInputs(inputs, idProperty) {
+  const valid = [];
+  const invalid = [];
+  for (const input of inputs) {
+    const val = input?.properties?.[idProperty];
+    if (val === undefined || val === null || val === '') {
+      invalid.push({
+        reason: `Missing idProperty value (${idProperty})`,
+        input,
+      });
+    } else {
+      valid.push(input);
+    }
+  }
+  return { valid, invalid };
+}
+
+/**
+ * Upsert a batch of records. Returns per-input outcome:
+ *   { succeeded: [{ sourceKey, hubspotId, wasNew }], failed: [{ sourceKey, reason }] }
+ *
+ * Records are matched between input and response via the idProperty value.
+ * Anything in input that isn't echoed back in the response is treated as failed.
+ */
 async function batchUpsert(objectType, idProperty, inputs) {
-  const results = { created: 0, updated: 0, failed: 0, errors: [] };
+  const succeeded = [];
+  const failed = [];
 
   for (let i = 0; i < inputs.length; i += BATCH_SIZE) {
     const batch = inputs.slice(i, i + BATCH_SIZE);
-    const endpoint = objectType.startsWith('2-')
-      ? `/crm/v3/objects/${objectType}/batch/upsert`
-      : `/crm/v3/objects/${objectType}/batch/upsert`;
+    const endpoint = `/crm/v3/objects/${objectType}/batch/upsert`;
 
+    // Build the set of keys we sent, so we can identify what came back and what didn't.
+    const sentKeys = new Set(batch.map(b => b.properties?.[idProperty]).filter(Boolean));
+
+    let response;
     try {
-      const response = await hubspotFetch(endpoint, {
+      response = await hubspotFetch(endpoint, {
         method: 'POST',
-        body: JSON.stringify({
-          inputs: batch,
-          idProperty,
-        }),
+        body: JSON.stringify({ inputs: batch, idProperty }),
       });
+    } catch (err) {
+      // Network-level or retry-exhausted failure — entire batch failed.
+      for (const key of sentKeys) {
+        failed.push({
+          sourceKey: key,
+          reason: `Batch request failed: ${err.message}`,
+        });
+      }
+      continue;
+    }
 
-      if (response.results) {
-        for (const result of response.results) {
-          if (result.new) {
-            results.created++;
-          } else {
-            results.updated++;
-          }
+    // 2xx: process the results array and mark success per-record.
+    if (response.ok) {
+      const results = Array.isArray(response.body?.results) ? response.body.results : [];
+      const returnedKeys = new Set();
+      for (const r of results) {
+        const key = r?.properties?.[idProperty];
+        if (!key) continue;
+        returnedKeys.add(key);
+        succeeded.push({
+          sourceKey: key,
+          hubspotId: r.id,
+          wasNew: !!r.new,
+        });
+      }
+      // Any sent key not echoed back = failed silently. Record as failure.
+      for (const key of sentKeys) {
+        if (!returnedKeys.has(key)) {
+          failed.push({
+            sourceKey: key,
+            reason: `HubSpot did not echo back idProperty value — record not confirmed`,
+          });
         }
       }
-
-      console.log(`Batch upsert ${objectType}: ${i + batch.length}/${inputs.length}`);
-    } catch (err) {
-      results.failed += batch.length;
-      results.errors.push({
-        batch: `${i}-${i + batch.length}`,
-        error: err.message,
-      });
-      console.error(`Batch upsert failed for ${objectType} batch ${i}: ${err.message}`);
-    }
-  }
-
-  return results;
-}
-
-async function saveHubspotIds(sourceTable, objectType, apiResults, keyField) {
-  if (!apiResults || !apiResults.length) return;
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    for (const result of apiResults) {
-      const sourceKey = result.properties[keyField];
-      if (!sourceKey) continue;
-
-      await client.query(
-        `INSERT INTO hubspot_id_map (source_table, source_key, hubspot_id, object_type, updated_at)
-         VALUES ($1, $2, $3, $4, NOW())
-         ON CONFLICT (source_table, source_key)
-         DO UPDATE SET hubspot_id = $3, updated_at = NOW()`,
-        [sourceTable, sourceKey, result.id, objectType]
-      );
-    }
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-// --- Sync functions per object type ---
-
-async function syncCifContacts(rows) {
-  const inputs = rows.map(row => {
-    const normalized = normalizeCifContact(row);
-    return {
-      idProperty: 'cif_number',
-      id: normalized.cif_number,
-      properties: {
-        cif_number: normalized.cif_number,
-        firstname: normalized.firstname,
-        lastname: normalized.lastname,
-        fullname: normalized.fullname,
-        email: normalized.email,
-        phone: normalized.phone,
-        address: normalized.address,
-        address2: normalized.address2,
-        city: normalized.city,
-        state: normalized.state,
-        zip: normalized.zip,
-        date_of_birth: normalized.date_of_birth,
-        became_customer_date: normalized.became_customer_date,
-        hash_ssn: normalized.hash_ssn,
-        digital_banking: normalized.digital_banking,
-        private_banking: normalized.private_banking,
-        deceased: normalized.deceased,
-        minor: normalized.minor,
-        do_not_call: normalized.do_not_call,
-        q2_user_id: normalized.q2_user_id,
-        last_login: normalized.last_login,
-      },
-    };
-  });
-
-  // Remove null/undefined properties
-  for (const input of inputs) {
-    for (const [key, val] of Object.entries(input.properties)) {
-      if (val === null || val === undefined) {
-        delete input.properties[key];
+    } else {
+      // 4xx/5xx — the whole batch failed. Record all inputs as failed with the API error.
+      const errMsg = response.body?.message || response.body?.raw || `HTTP ${response.status}`;
+      for (const key of sentKeys) {
+        failed.push({
+          sourceKey: key,
+          reason: `HubSpot ${response.status}: ${errMsg}`,
+        });
       }
     }
+
+    console.log(
+      `Batch upsert ${objectType} [${i}-${i + batch.length}]: ` +
+      `${succeeded.length} cum. ok, ${failed.length} cum. failed`
+    );
   }
 
-  return batchUpsert('contacts', 'cif_number', inputs);
+  return { succeeded, failed };
 }
 
-async function syncCifCompanies(rows) {
-  const inputs = rows.map(row => {
-    const normalized = normalizeCifCompany(row);
-    return {
-      idProperty: 'cif_number',
-      id: normalized.cif_number,
-      properties: {
-        cif_number: normalized.cif_number,
-        name: normalized.name,
-        phone: normalized.phone,
-        address: normalized.address,
-        address2: normalized.address2,
-        city: normalized.city,
-        state: normalized.state,
-        zip: normalized.zip,
-        became_customer_date: normalized.became_customer_date,
-        naics_code: normalized.naics_code,
-      },
-    };
+function stripNullProps(input) {
+  for (const [k, v] of Object.entries(input.properties)) {
+    if (v === null || v === undefined) delete input.properties[k];
+  }
+  return input;
+}
+
+// Each sync function returns { succeeded, failed, invalidInputs }.
+// invalidInputs are records that failed preflight (missing idProperty).
+
+function buildInputs(rows, normalizer, idProperty) {
+  return rows.map(row => {
+    const n = normalizer(row);
+    return stripNullProps({
+      idProperty,
+      id: n[idProperty],
+      properties: { ...n },
+    });
   });
-
-  for (const input of inputs) {
-    for (const [key, val] of Object.entries(input.properties)) {
-      if (val === null || val === undefined) {
-        delete input.properties[key];
-      }
-    }
-  }
-
-  return batchUpsert('companies', 'cif_number', inputs);
 }
 
-async function syncDda(rows) {
-  const inputs = rows.map(row => {
-    const normalized = normalizeDda(row);
-    return {
-      idProperty: 'primary_key',
-      id: normalized.primary_key,
-      properties: {
-        primary_key: normalized.primary_key,
-        cif_number: normalized.cif_number,
-        acctlast4: normalized.acctlast4,
-        interest_rate: normalized.interest_rate,
-        accttype: normalized.accttype,
-        acctdesc: normalized.acctdesc,
-        open_date: normalized.open_date,
-        close_date: normalized.close_date,
-        slsassoc: normalized.slsassoc,
-        dt_last_active: normalized.dt_last_active,
-        current_bal: normalized.current_bal,
-        yest_bal: normalized.yest_bal,
-        branch_num: normalized.branch_num,
-        officr_code: normalized.officr_code,
-        acct_status: normalized.acct_status,
-        relationship: normalized.relationship,
-        promo_code: normalized.promo_code,
-        open_online: normalized.open_online,
-      },
-    };
-  });
-
-  for (const input of inputs) {
-    for (const [key, val] of Object.entries(input.properties)) {
-      if (val === null || val === undefined) {
-        delete input.properties[key];
-      }
-    }
-  }
-
-  return batchUpsert(CUSTOM_OBJECTS.dda, 'primary_key', inputs);
+async function syncHubspot(objectType, idProperty, rows, normalizer) {
+  const inputs = buildInputs(rows, normalizer, idProperty);
+  const { valid, invalid } = validateBatchInputs(inputs, idProperty);
+  const { succeeded, failed } = valid.length > 0
+    ? await batchUpsert(objectType, idProperty, valid)
+    : { succeeded: [], failed: [] };
+  return { succeeded, failed, invalidInputs: invalid };
 }
 
-async function syncLoans(rows) {
-  const inputs = rows.map(row => {
-    const normalized = normalizeLoan(row);
-    return {
-      idProperty: 'primary_key',
-      id: normalized.primary_key,
-      properties: {
-        primary_key: normalized.primary_key,
-        cif_number: normalized.cif_number,
-        acctlast4: normalized.acctlast4,
-        interest_rate: normalized.interest_rate,
-        accttype: normalized.accttype,
-        loan_type: normalized.loan_type,
-        orig_date: normalized.orig_date,
-        maturity_date: normalized.maturity_date,
-        slsassoc: normalized.slsassoc,
-        last_active_date: normalized.last_active_date,
-        curr_bal: normalized.curr_bal,
-        branch_num: normalized.branch_num,
-        officr_code: normalized.officr_code,
-        acct_status: normalized.acct_status,
-        relationship: normalized.relationship,
-        orig_bal: normalized.orig_bal,
-      },
-    };
-  });
-
-  for (const input of inputs) {
-    for (const [key, val] of Object.entries(input.properties)) {
-      if (val === null || val === undefined) {
-        delete input.properties[key];
-      }
-    }
-  }
-
-  return batchUpsert(CUSTOM_OBJECTS.loans, 'primary_key', inputs);
-}
-
-async function syncCds(rows) {
-  const inputs = rows.map(row => {
-    const normalized = normalizeCd(row);
-    return {
-      idProperty: 'primary_key',
-      id: normalized.primary_key,
-      properties: {
-        primary_key: normalized.primary_key,
-        cif_number: normalized.cif_number,
-        acctlast4: normalized.acctlast4,
-        interest_rate: normalized.interest_rate,
-        accttype: normalized.accttype,
-        acctdesc: normalized.acctdesc,
-        issue_date: normalized.issue_date,
-        maturity_date: normalized.maturity_date,
-        slsassoc: normalized.slsassoc,
-        curr_bal: normalized.curr_bal,
-        branch_num: normalized.branch_num,
-        officr_code: normalized.officr_code,
-        acct_status: normalized.acct_status,
-        relationship: normalized.relationship,
-        open_online: normalized.open_online,
-      },
-    };
-  });
-
-  for (const input of inputs) {
-    for (const [key, val] of Object.entries(input.properties)) {
-      if (val === null || val === undefined) {
-        delete input.properties[key];
-      }
-    }
-  }
-
-  return batchUpsert(CUSTOM_OBJECTS.cd, 'primary_key', inputs);
-}
-
-async function syncDebitCards(rows) {
-  const inputs = rows.map(row => {
-    const normalized = normalizeDebitCard(row);
-    return {
-      idProperty: 'composite_key',
-      id: normalized.composite_key,
-      properties: {
-        composite_key: normalized.composite_key,
-        cif_number: normalized.cif_number,
-        acctlast4: normalized.acctlast4,
-        acct_type: normalized.acct_type,
-        last4_debit_card: normalized.last4_debit_card,
-        card_status: normalized.card_status,
-        expire_date: normalized.expire_date,
-        last_used_dt: normalized.last_used_dt,
-        pos_last_30_days: normalized.pos_last_30_days,
-        active_pos: normalized.active_pos,
-      },
-    };
-  });
-
-  for (const input of inputs) {
-    for (const [key, val] of Object.entries(input.properties)) {
-      if (val === null || val === undefined) {
-        delete input.properties[key];
-      }
-    }
-  }
-
-  return batchUpsert(CUSTOM_OBJECTS.debit_cards, 'composite_key', inputs);
-}
+async function syncCifContacts(rows)  { return syncHubspot('contacts',               'cif_number',   rows, normalizeCifContact); }
+async function syncCifCompanies(rows) { return syncHubspot('companies',              'cif_number',   rows, normalizeCifCompany); }
+async function syncDda(rows)          { return syncHubspot(CUSTOM_OBJECTS.dda,        'primary_key',  rows, normalizeDda); }
+async function syncLoans(rows)        { return syncHubspot(CUSTOM_OBJECTS.loans,      'primary_key',  rows, normalizeLoan); }
+async function syncCds(rows)          { return syncHubspot(CUSTOM_OBJECTS.cd,         'primary_key',  rows, normalizeCd); }
+async function syncDebitCards(rows)   { return syncHubspot(CUSTOM_OBJECTS.debit_cards, 'composite_key', rows, normalizeDebitCard); }
 
 module.exports = {
   hubspotFetch,
   batchUpsert,
-  saveHubspotIds,
+  validateBatchInputs,
   syncCifContacts,
   syncCifCompanies,
   syncDda,
