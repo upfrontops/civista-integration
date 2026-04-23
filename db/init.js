@@ -4,6 +4,16 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+/**
+ * Schema. Staging tables mirror HubSpot property names 1:1 — no transposition.
+ * If HubSpot adds/renames a property, this file and hubspot-mapping.js
+ * are the two places to update.
+ *
+ * All staging columns are TEXT at the DB level. Type coercion (number, bool, date)
+ * happens at send time using the type hints in hubspot-mapping.js. This keeps
+ * the ingest path forgiving (we can always store whatever the CSV has)
+ * and puts type validation at the HubSpot boundary.
+ */
 async function initDb() {
   const client = await pool.connect();
   try {
@@ -26,142 +36,184 @@ async function initDb() {
       );
     `);
 
+    // --- Contacts (from CIF CSV, classified as individual) ---
     await client.query(`
-      CREATE TABLE IF NOT EXISTS stg_cif (
+      CREATE TABLE IF NOT EXISTS stg_contacts (
         id SERIAL PRIMARY KEY,
+        -- HubSpot standard properties
         firstname TEXT,
         lastname TEXT,
-        fullname TEXT,
-        birthday TEXT,
-        address1 TEXT,
-        address2 TEXT,
+        email TEXT,
+        phone TEXT,
+        address TEXT,
         city TEXT,
         state TEXT,
-        zipcode TEXT,
-        email TEXT,
-        hashssn TEXT,
+        zip TEXT,
+        date_of_birth TEXT,
+        -- HubSpot custom properties (names match HubSpot exactly)
         cif_number TEXT,
-        privbanking TEXT,
-        donotcall TEXT,
-        age TEXT,
-        minor TEXT,
-        insidercode TEXT,
-        insufficientaddress TEXT,
-        clfflag TEXT,
-        civatwork TEXT,
-        origcustdate TEXT,
-        deceased TEXT,
-        sex TEXT,
-        classcode TEXT,
-        taxidtype TEXT,
-        custrelnum TEXT,
-        digbank TEXT,
-        naicscode TEXT,
-        tm TEXT,
-        atmdebitcard TEXT,
-        q2userid TEXT,
-        lastlogin TEXT,
-        recurtrans TEXT,
-        phonenumber TEXT,
-        stmttype TEXT,
-        enrollmentdt TEXT,
-        centralgroupid TEXT,
-        textoptin TEXT,
-        discacpt TEXT,
-        record_type VARCHAR(10),
+        street_address_2 TEXT,
+        hashed_ssn TEXT,
+        private_banking_flag_yn TEXT,
+        dnc_flag_yn TEXT,
+        minor_flag_yn TEXT,
+        insider_code TEXT,
+        insufficient_address_yn TEXT,
+        clf_flag_yn TEXT,
+        civistawork_yn TEXT,
+        orginal_customer_date TEXT,
+        deceased_flag_yn TEXT,
+        class_code TEXT,
+        tax_id_type TEXT,
+        customer_relationship_number TEXT,
+        digital_banking_flag_yn TEXT,
+        atmdebit_card_yn TEXT,
+        q2_user_id TEXT,
+        last_login TEXT,
+        recurring_transactions_yn TEXT,
+        stmt_type TEXT,
+        enrollment_date TEXT,
+        central_group_id TEXT,
+        text_opt_in TEXT,
+        estatement_disclosure_acceptance_date TEXT,
+        -- Internal
         row_hash VARCHAR(64),
-        synced_at TIMESTAMPTZ
+        loaded_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
+    // --- Companies (from CIF CSV, classified as business) ---
     await client.query(`
-      CREATE TABLE IF NOT EXISTS stg_dda (
+      CREATE TABLE IF NOT EXISTS stg_companies (
         id SERIAL PRIMARY KEY,
-        primarykey TEXT,
-        acctlast4 TEXT,
+        -- HubSpot standard
+        name TEXT,
+        email TEXT,
+        phone TEXT,
+        address TEXT,
+        city TEXT,
+        state TEXT,
+        zip TEXT,
+        -- Custom
         cif_number TEXT,
-        interestrate TEXT,
-        accttype TEXT,
-        acctdesc TEXT,
-        opendate TEXT,
-        closedate TEXT,
-        slsassoc TEXT,
-        dtlastactive TEXT,
-        currentbal TEXT,
-        yestbal TEXT,
-        branchnum TEXT,
-        officrcode TEXT,
-        acctstatus TEXT,
-        relationship TEXT,
-        promocode TEXT,
-        openonline TEXT,
+        naics_code TEXT,
+        treasury_management_flag_yn TEXT,
+        hashed_ssn TEXT,
+        dnc_flag_yn TEXT,
+        insider_code TEXT,
+        insufficient_address_yn TEXT,
+        clf_flag_yn TEXT,
+        civistawork_yn TEXT,
+        orginal_customer_date TEXT,
+        deceased_flag_yn TEXT,
+        class_code TEXT,
+        tax_id_type TEXT,
+        customer_relationship_number TEXT,
+        digital_banking_flag_yn TEXT,
+        atmdebit_card_yn TEXT,
+        q2_user_id TEXT,
+        last_login TEXT,
+        recurring_transactions_yn TEXT,
+        stmt_type TEXT,
+        enrollment_date TEXT,
+        central_group_id TEXT,
+        text_opt_in TEXT,
+        estatement_disclosure_acceptance_date TEXT,
+        -- Internal
         row_hash VARCHAR(64),
-        synced_at TIMESTAMPTZ
+        loaded_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
+    // --- Deposits (DDA CSV → custom object 2-60442978) ---
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS stg_deposits (
+        id SERIAL PRIMARY KEY,
+        primary_key TEXT,
+        cif_number TEXT,
+        last_4_account_digits TEXT,
+        interest_rate TEXT,
+        account_type TEXT,
+        account_description TEXT,
+        date_opened TEXT,
+        date_closed TEXT,
+        sales_associate TEXT,
+        date_last_active TEXT,
+        current_balance TEXT,
+        yesterdays_balance TEXT,
+        branch_number TEXT,
+        officer_name TEXT,
+        deposit_account_status TEXT,
+        promo_code TEXT,
+        opened_online_yn TEXT,
+        row_hash VARCHAR(64),
+        loaded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // --- Loans (custom object 2-60442977) ---
     await client.query(`
       CREATE TABLE IF NOT EXISTS stg_loans (
         id SERIAL PRIMARY KEY,
-        primarykey TEXT,
-        acctlast4 TEXT,
+        primary_key TEXT,
         cif_number TEXT,
-        interestrate TEXT,
-        accttype TEXT,
-        loantype TEXT,
-        origdate TEXT,
-        maturitydate TEXT,
-        slsassoc TEXT,
-        lastactivedate TEXT,
-        currbal TEXT,
-        branchnum TEXT,
-        officrcode TEXT,
-        acctstatus TEXT,
-        relationship TEXT,
-        origbal TEXT,
+        last_4_account_digits TEXT,
+        interest_rate TEXT,
+        account_type TEXT,
+        loan_type TEXT,
+        orgination_date TEXT,
+        maturity_date TEXT,
+        sales_associate TEXT,
+        date_last_active TEXT,
+        current_balance TEXT,
+        branch_number TEXT,
+        officer_name TEXT,
+        loan_status TEXT,
+        original_balance TEXT,
         row_hash VARCHAR(64),
-        synced_at TIMESTAMPTZ
+        loaded_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
+    // --- Time Deposits / CDs (custom object 2-60442980) ---
     await client.query(`
-      CREATE TABLE IF NOT EXISTS stg_cd (
+      CREATE TABLE IF NOT EXISTS stg_time_deposits (
         id SERIAL PRIMARY KEY,
-        primarykey TEXT,
-        acctlast4 TEXT,
+        primary_key TEXT,
         cif_number TEXT,
-        interestrate TEXT,
-        accttype TEXT,
-        acctdesc TEXT,
-        issuedate TEXT,
-        maturitydate TEXT,
-        slsassoc TEXT,
-        currbal TEXT,
-        branchnum TEXT,
-        officrcode TEXT,
-        acctstatus TEXT,
-        relationship TEXT,
-        openonline TEXT,
+        last_4_account_digits TEXT,
+        interest_rate TEXT,
+        account_type TEXT,
+        account_description TEXT,
+        issue_date TEXT,
+        maturity_date TEXT,
+        sales_associate TEXT,
+        current_balance TEXT,
+        branch_number TEXT,
+        officer_name TEXT,
+        time_deposit_status TEXT,
+        opened_online_yn TEXT,
         row_hash VARCHAR(64),
-        synced_at TIMESTAMPTZ
+        loaded_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
+    // --- Debit Cards (custom object 2-60442979) ---
     await client.query(`
       CREATE TABLE IF NOT EXISTS stg_debit_cards (
         id SERIAL PRIMARY KEY,
+        composite_key TEXT,
         cif_number TEXT,
-        acctlast4 TEXT,
-        accttype TEXT,
-        last4debitcard TEXT,
-        cardstatus TEXT,
-        expiredate TEXT,
-        lastuseddt TEXT,
-        poslast30days TEXT,
-        activepos TEXT,
-        composite_key VARCHAR(255),
+        last_4_of_associated_account TEXT,
+        associated_account_type TEXT,
+        last_4_of_debit_card_digits TEXT,
+        card_status TEXT,
+        expiration_date TEXT,
+        last_used TEXT,
+        pos_trans_count__last_30_day TEXT,
+        active_pos TEXT,
         row_hash VARCHAR(64),
-        synced_at TIMESTAMPTZ
+        loaded_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
@@ -177,9 +229,7 @@ async function initDb() {
       );
     `);
 
-    // Audit ledger: what has been successfully sent to HubSpot.
-    // Replaces the broken synced_at approach. Diff engine uses this as
-    // source of truth for "has this (key, hash) been shipped?"
+    // Audit ledger of what has been successfully shipped to HubSpot.
     await client.query(`
       CREATE TABLE IF NOT EXISTS shipped_records (
         source_table VARCHAR(50) NOT NULL,
@@ -191,8 +241,8 @@ async function initDb() {
       );
     `);
 
-    // Every failure or quarantine is a first-class row here. Nothing is silent.
-    // error_type values: classification, validation, hubspot_batch, hubspot_record, parse, infra
+    // sync_errors: every failure, quarantine, OR loud warning is a first-class row here.
+    // severity: 'error' (data blocked/quarantined) | 'warning' (operator attention) | 'info' (notable event)
     await client.query(`
       CREATE TABLE IF NOT EXISTS sync_errors (
         id SERIAL PRIMARY KEY,
@@ -200,14 +250,20 @@ async function initDb() {
         source_table VARCHAR(50),
         source_key VARCHAR(255),
         error_type VARCHAR(50) NOT NULL,
+        severity VARCHAR(10) NOT NULL DEFAULT 'error',
         error_message TEXT,
         record_snapshot JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // Ensure severity column exists on any pre-existing deployments.
+    await client.query(`
+      ALTER TABLE sync_errors ADD COLUMN IF NOT EXISTS severity VARCHAR(10) NOT NULL DEFAULT 'error'
+    `);
 
     await client.query(`CREATE INDEX IF NOT EXISTS idx_sync_errors_run ON sync_errors(run_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_sync_errors_created ON sync_errors(created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_sync_errors_severity ON sync_errors(severity)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_shipped_hash ON shipped_records(source_table, source_key, row_hash)`);
 
     await client.query('COMMIT');
