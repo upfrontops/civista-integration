@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Civista Sync — Debug Console</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c2128;
+    --fg: #e6edf3;
+    --dim: #8b949e;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --accent: #58a6ff;
+    --border: #30363d;
+    --radius: 6px;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,sans-serif; font-size:14px; }
+  h1 { font-size:18px; margin:0; padding:14px 20px; border-bottom:1px solid var(--border); background:var(--panel); }
+  h1 span { color:var(--dim); font-weight:400; margin-left:8px; font-size:14px; }
+  .layout { display:grid; grid-template-columns: 420px 1fr; min-height:calc(100vh - 51px); }
+  .col { padding:20px; overflow-y:auto; }
+  .left { background:var(--panel); border-right:1px solid var(--border); }
+  section { background:var(--panel2); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:16px; padding:14px; }
+  section.disabled { opacity:0.4; pointer-events:none; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.5px; color:var(--dim); margin:0 0 10px 0; }
+  label { display:block; font-size:12px; color:var(--dim); margin:10px 0 4px 0; }
+  input[type=text], input[type=password], input[type=number] {
+    width:100%; box-sizing:border-box; padding:8px 10px; background:var(--bg); color:var(--fg);
+    border:1px solid var(--border); border-radius:4px; font-family:var(--font-mono); font-size:13px;
+  }
+  input:focus { outline:none; border-color:var(--accent); }
+  button {
+    background:var(--accent); color:#0d1117; border:none; padding:8px 14px; border-radius:4px;
+    font-weight:600; cursor:pointer; font-size:13px; margin-top:8px; margin-right:6px;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { background:var(--border); color:var(--dim); cursor:not-allowed; filter:none; }
+  button.secondary { background:var(--panel); color:var(--fg); border:1px solid var(--border); }
+  .status {
+    font-family:var(--font-mono); font-size:12px; padding:8px; border-radius:4px;
+    background:var(--bg); border:1px solid var(--border); margin-top:10px; white-space:pre-wrap; word-break:break-all;
+  }
+  .status.ok { border-color:var(--ok); color:var(--ok); }
+  .status.err { border-color:var(--err); color:var(--err); }
+  .status.warn { border-color:var(--warn); color:var(--warn); }
+  .files-list { margin:8px 0 0 0; padding:0; list-style:none; font-family:var(--font-mono); font-size:12px; }
+  .files-list li { padding:4px 8px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; }
+  .files-list li:last-child { border-bottom:none; }
+  .files-list .name { color:var(--fg); }
+  .files-list .meta { color:var(--dim); }
+
+  .right { display:flex; flex-direction:column; background:var(--bg); padding:0; }
+  .right h2 { padding:14px 20px 0 20px; margin:0; }
+  .log-wrap { flex:1; display:flex; flex-direction:column; min-height:400px; padding:0 20px 10px 20px; }
+  #log {
+    flex:1; background:#010409; border:1px solid var(--border); border-radius:var(--radius);
+    padding:10px; font-family:var(--font-mono); font-size:12px; line-height:1.5;
+    overflow-y:auto; white-space:pre-wrap; word-break:break-all; min-height:300px; max-height:50vh;
+  }
+  #log .info { color:var(--fg); }
+  #log .warn { color:var(--warn); }
+  #log .error { color:var(--err); }
+  #log .ts { color:var(--dim); margin-right:8px; }
+  .log-toolbar { display:flex; gap:8px; padding:6px 0; align-items:center; font-size:12px; color:var(--dim); }
+
+  .schema-wrap { padding:0 20px 20px 20px; }
+  .schema-obj { background:var(--panel2); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:12px; }
+  .schema-obj summary { cursor:pointer; padding:10px 14px; font-weight:600; list-style:none; display:flex; justify-content:space-between; align-items:center; }
+  .schema-obj summary::-webkit-details-marker { display:none; }
+  .schema-obj summary::before { content:'▶'; color:var(--dim); margin-right:8px; display:inline-block; transition:transform 0.15s; }
+  .schema-obj[open] summary::before { transform:rotate(90deg); }
+  .schema-obj .counts { font-family:var(--font-mono); font-size:12px; color:var(--dim); }
+  .schema-obj .counts b { color:var(--fg); }
+  table.schema-table { width:100%; border-collapse:collapse; font-family:var(--font-mono); font-size:12px; }
+  table.schema-table th { text-align:left; padding:6px 10px; color:var(--dim); font-weight:600; border-bottom:1px solid var(--border); background:var(--panel); }
+  table.schema-table td { padding:6px 10px; border-bottom:1px solid var(--border); }
+  table.schema-table tr.match td { color:var(--fg); }
+  table.schema-table tr.pg-only td { color:var(--err); }
+  table.schema-table tr.hs-only td { color:var(--dim); }
+  .badge { display:inline-block; padding:2px 6px; border-radius:3px; font-size:11px; background:var(--border); color:var(--fg); }
+  .badge.ok { background:#1b4628; color:#3fb950; }
+  .badge.err { background:#4e1f1f; color:#f85149; }
+
+  .spinner { display:inline-block; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; width:12px; height:12px; animation:spin 0.8s linear infinite; vertical-align:-1px; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<h1>Civista Sync — Debug Console <span>simulates MOVEit delivery over SFTP</span></h1>
+
+<div class="layout">
+
+<div class="col left">
+
+  <section id="panel-auth">
+    <h2>① SFTP Connection</h2>
+    <p style="margin:0 0 8px 0; color:var(--dim); font-size:12px;">
+      Every action below routes through the Railway SFTP endpoint.
+      If auth fails, nothing works — by design.
+    </p>
+    <label>Host</label>
+    <input id="sftp-host" type="text" placeholder="e.g. hopper.proxy.rlwy.net" autocomplete="off">
+    <label>Port</label>
+    <input id="sftp-port" type="number" placeholder="e.g. 34212" autocomplete="off">
+    <label>Username</label>
+    <input id="sftp-user" type="text" value="civista" autocomplete="username">
+    <label>Password</label>
+    <input id="sftp-pass" type="password" autocomplete="current-password">
+    <button id="btn-connect">Connect</button>
+    <div id="auth-status" class="status">Not connected.</div>
+  </section>
+
+  <section id="panel-upload" class="disabled">
+    <h2>② Upload CSVs</h2>
+    <p style="margin:0 0 8px 0; color:var(--dim); font-size:12px;">
+      Drop the 5 CSVs. Each is pushed via SFTP to the Railway endpoint,
+      just like MOVEit would.
+    </p>
+    <input id="file-picker" type="file" multiple accept=".csv">
+    <button id="btn-upload" disabled>Upload via SFTP</button>
+    <ul id="file-list" class="files-list"></ul>
+  </section>
+
+  <section id="panel-actions" class="disabled">
+    <h2>③ Run</h2>
+    <button id="btn-sync" class="secondary">Run Full Sync</button>
+    <button id="btn-schema-refresh" class="secondary">Refresh Schema Check</button>
+    <div id="action-status" class="status">Idle.</div>
+  </section>
+
+</div>
+
+<div class="col right">
+  <h2>Live Log <span style="color:var(--dim); font-weight:400; margin-left:8px;" id="log-status">waiting...</span></h2>
+  <div class="log-wrap">
+    <div id="log"></div>
+    <div class="log-toolbar">
+      <button class="secondary" id="btn-clear-log" style="margin:0;">Clear</button>
+      <label style="margin:0; color:var(--dim); display:flex; align-items:center; gap:4px;">
+        <input type="checkbox" id="cb-autoscroll" checked> Auto-scroll
+      </label>
+    </div>
+  </div>
+
+  <h2>Schema Check — HubSpot vs Postgres</h2>
+  <div class="schema-wrap" id="schema-wrap">
+    <p style="color:var(--dim); font-size:12px;">Loading from HubSpot API &amp; Postgres...</p>
+  </div>
+</div>
+
+</div>
+
+<script>
+// Safe DOM helpers — no innerHTML on untrusted strings.
+function el(tag, attrs = {}, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'className') n.className = v;
+    else if (k === 'style') n.setAttribute('style', v);
+    else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2).toLowerCase(), v);
+    else n.setAttribute(k, v);
+  }
+  for (const c of children) {
+    if (c === null || c === undefined) continue;
+    n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return n;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+const qs = (s) => document.querySelector(s);
+
+const $host = qs('#sftp-host'), $port = qs('#sftp-port'),
+      $user = qs('#sftp-user'), $pass = qs('#sftp-pass');
+const $authStatus = qs('#auth-status');
+const $panelUpload = qs('#panel-upload'), $panelActions = qs('#panel-actions');
+const $btnConnect = qs('#btn-connect'), $btnUpload = qs('#btn-upload'),
+      $btnSync = qs('#btn-sync'), $btnSchemaRefresh = qs('#btn-schema-refresh');
+const $filePicker = qs('#file-picker'), $fileList = qs('#file-list');
+const $log = qs('#log'), $logStatus = qs('#log-status');
+const $actionStatus = qs('#action-status');
+const $schemaWrap = qs('#schema-wrap');
+const $cbAutoscroll = qs('#cb-autoscroll');
+const $btnClearLog = qs('#btn-clear-log');
+
+// Persist SFTP creds in sessionStorage so F5 doesn't kick you out.
+['host','port','user','pass'].forEach(k => {
+  const node = qs('#sftp-' + k);
+  const v = sessionStorage.getItem('sftp_' + k);
+  if (v) node.value = v;
+  node.addEventListener('input', () => sessionStorage.setItem('sftp_' + k, node.value));
+});
+
+function creds() {
+  return {
+    host: $host.value.trim(),
+    port: parseInt($port.value, 10),
+    username: $user.value.trim(),
+    password: $pass.value,
+  };
+}
+function setStatus(node, text, level = 'info') {
+  node.textContent = text;
+  node.className = 'status ' + (level === 'info' ? '' : level);
+}
+function enablePanels(on) {
+  ($panelUpload.classList)[on ? 'remove' : 'add']('disabled');
+  ($panelActions.classList)[on ? 'remove' : 'add']('disabled');
+}
+
+async function connect() {
+  $btnConnect.disabled = true;
+  setStatus($authStatus, 'Connecting to SFTP…', 'info');
+  try {
+    const res = await fetch('/api/sftp-auth', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(creds()),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      setStatus($authStatus, '✗ ' + (body.error || 'Auth failed'), 'err');
+      enablePanels(false);
+    } else {
+      setStatus($authStatus, '✓ Authenticated to ' + $host.value + ':' + $port.value, 'ok');
+      enablePanels(true);
+    }
+  } catch (e) {
+    setStatus($authStatus, '✗ ' + e.message, 'err');
+    enablePanels(false);
+  }
+  $btnConnect.disabled = false;
+}
+$btnConnect.addEventListener('click', connect);
+
+$filePicker.addEventListener('change', () => {
+  clear($fileList);
+  const files = Array.from($filePicker.files);
+  for (const f of files) {
+    const li = el('li', {},
+      el('span', { className: 'name' }, f.name),
+      el('span', { className: 'meta' }, Math.round(f.size / 1024) + ' KB'),
+    );
+    $fileList.appendChild(li);
+  }
+  $btnUpload.disabled = files.length === 0;
+});
+
+$btnUpload.addEventListener('click', async () => {
+  const files = Array.from($filePicker.files);
+  if (!files.length) return;
+  $btnUpload.disabled = true;
+
+  for (const f of files) {
+    const itemEl = Array.from($fileList.children).find(e => e.querySelector('.name').textContent === f.name);
+    const metaEl = itemEl ? itemEl.querySelector('.meta') : null;
+    if (metaEl) metaEl.textContent = 'uploading…';
+    const fd = new FormData();
+    fd.append('file', f, f.name);
+    fd.append('creds', JSON.stringify(creds()));
+    try {
+      const res = await fetch('/api/sftp-upload', { method:'POST', body: fd });
+      const body = await res.json();
+      if (metaEl) metaEl.textContent = res.ok ? '✓ delivered' : '✗ ' + (body.error || 'failed');
+    } catch (e) {
+      if (metaEl) metaEl.textContent = '✗ ' + e.message;
+    }
+  }
+  $btnUpload.disabled = false;
+});
+
+$btnSync.addEventListener('click', async () => {
+  setStatus($actionStatus, 'Sync starting…', 'info');
+  try {
+    const res = await fetch('/sync', { method:'POST' });
+    const body = await res.json();
+    setStatus($actionStatus, res.ok ? '✓ Sync running — watch the log' : '✗ ' + (body.error || 'sync failed'), res.ok ? 'ok' : 'err');
+  } catch (e) {
+    setStatus($actionStatus, '✗ ' + e.message, 'err');
+  }
+});
+$btnSchemaRefresh.addEventListener('click', loadSchemaCheck);
+
+function addLogLine({ level, message, at }) {
+  const row = el('div', { className: level || 'info' },
+    el('span', { className: 'ts' }, (at || new Date().toISOString()).split('T')[1].slice(0,8)),
+    message,
+  );
+  $log.appendChild(row);
+  if ($cbAutoscroll.checked) $log.scrollTop = $log.scrollHeight;
+}
+$btnClearLog.addEventListener('click', () => { clear($log); });
+
+function startStream() {
+  const es = new EventSource('/api/stream');
+  es.onopen  = () => { $logStatus.textContent = '● connected'; $logStatus.style.color = 'var(--ok)'; };
+  es.onerror = () => { $logStatus.textContent = '● reconnecting'; $logStatus.style.color = 'var(--warn)'; };
+  es.addEventListener('log', (ev) => {
+    try { addLogLine(JSON.parse(ev.data)); } catch { addLogLine({ level:'info', message: ev.data }); }
+  });
+}
+startStream();
+
+async function loadSchemaCheck() {
+  clear($schemaWrap);
+  $schemaWrap.appendChild(el('p', { style:'color:var(--dim); font-size:12px;' },
+    el('span', { className:'spinner' }),
+    'Querying HubSpot + Postgres…',
+  ));
+  try {
+    const res = await fetch('/api/schema-check');
+    const body = await res.json();
+    if (!res.ok) {
+      clear($schemaWrap);
+      $schemaWrap.appendChild(el('p', { style:'color:var(--err)' }, body.error || 'Failed to load schema check'));
+      return;
+    }
+    clear($schemaWrap);
+    for (const obj of body.objects) {
+      const details = el('details', { className: 'schema-obj' });
+      const countsEl = el('span', { className: 'counts' });
+      countsEl.appendChild(document.createTextNode(''));
+      // build counts row from safe text nodes
+      const addPair = (label, value) => {
+        countsEl.appendChild(el('b', {}, label));
+        countsEl.appendChild(document.createTextNode(' ' + value + '  '));
+      };
+      addPair('PG:', obj.pgRowCount);
+      addPair('HS:', obj.hsRowCount);
+      if (obj.csvRowCount !== null && obj.csvRowCount !== undefined) addPair('CSV:', obj.csvRowCount);
+      countsEl.appendChild(document.createTextNode(' — '));
+      countsEl.appendChild(el('span', { className: 'badge ' + (obj.missingInHs > 0 ? 'err' : 'ok') },
+        obj.matched + ' match / ' + obj.missingInHs + ' pg-only / ' + obj.missingInPg + ' hs-only'));
+
+      const summary = el('summary', {},
+        el('span', {}, obj.label, ' ',
+          el('span', { style:'color:var(--dim); font-weight:400;' }, '(' + obj.stagingTable + ' ↔ ' + obj.hsObject + ')')),
+        countsEl,
+      );
+      details.appendChild(summary);
+
+      const table = el('table', { className:'schema-table' });
+      const thead = el('thead', {},
+        el('tr', {},
+          el('th', {}, 'Postgres column'),
+          el('th', {}, 'HubSpot property'),
+          el('th', {}, 'HS type'),
+          el('th', {}, 'Status'),
+        ),
+      );
+      table.appendChild(thead);
+      const tbody = el('tbody', {});
+      for (const f of obj.fields) {
+        const tr = el('tr', { className: f.status },
+          el('td', {}, f.pgColumn || ''),
+          el('td', {}, f.hsProp || ''),
+          el('td', {}, f.hsType || ''),
+          el('td', {}, f.status === 'match' ? '✓ match' : f.status === 'pg-only' ? '✗ pg-only' : '• hs-only'),
+        );
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      details.appendChild(table);
+      $schemaWrap.appendChild(details);
+    }
+  } catch (e) {
+    clear($schemaWrap);
+    $schemaWrap.appendChild(el('p', { style:'color:var(--err)' }, e.message));
+  }
+}
+loadSchemaCheck();
+</script>
+</body>
+</html>
