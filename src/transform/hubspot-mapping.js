@@ -185,6 +185,29 @@ const TABLES = {
   },
 };
 
+/**
+ * Classify a raw CIF CSV row as 'contact', 'company', or 'unclassified'.
+ * Matches the business rules from CLAUDE.md:
+ *   - TaxIdType='T' AND FirstName empty AND LastName empty → company
+ *   - TaxIdType='T' AND FirstName+LastName populated      → contact (biz contact)
+ *   - TaxIdType is non-null AND != 'T'                    → contact
+ *   - anything else (NULL taxidtype, partial name data)   → unclassified
+ * Operates on the RAW CSV row (keys are CSV header names like 'TaxIdType').
+ */
+function classifyCifRow(row) {
+  const taxId = row.TaxIdType;
+  const first = (row.FirstName || '').trim();
+  const last  = (row.LastName  || '').trim();
+
+  if (taxId === 'T') {
+    if (first === '' && last === '') return 'company';
+    if (first !== '' && last !== '') return 'contact';
+    return 'unclassified';
+  }
+  if (taxId && taxId !== 'T') return 'contact';
+  return 'unclassified';
+}
+
 module.exports = {
   TABLES,
   CIF_COMMON,
@@ -196,4 +219,5 @@ module.exports = {
   LOANS_FIELDS,
   CD_FIELDS,
   DEBIT_CARDS_FIELDS,
+  classifyCifRow,
 };
