@@ -1,10 +1,14 @@
 const {
-  normalizeCifContact,
-  normalizeCifCompany,
-  normalizeDda,
-  normalizeLoan,
-  normalizeCd,
-  normalizeDebitCard,
+  TABLES,
+  CIF_CONTACT_FIELDS,
+  CIF_COMPANY_FIELDS,
+} = require('../transform/hubspot-mapping');
+const {
+  normalizeBoolean,
+  normalizeDeceased,
+  normalizeNumber,
+  normalizeDate,
+  normalizeEmail,
 } = require('../transform/normalize');
 
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
@@ -12,12 +16,8 @@ const BATCH_SIZE = 100;
 const MAX_RETRIES = 10;
 const INITIAL_DELAY = 100;
 
-const CUSTOM_OBJECTS = {
-  dda: '2-60442978',
-  loans: '2-60442977',
-  cd: '2-60442980',
-  debit_cards: '2-60442979',
-};
+// Internal columns that must be stripped before sending to HubSpot.
+const INTERNAL_COLUMNS = new Set(['id', 'row_hash', 'loaded_at', 'synced_at']);
 
 async function hubspotFetch(path, options = {}) {
   const url = `${HUBSPOT_API_BASE}${path}`;
@@ -42,8 +42,6 @@ async function hubspotFetch(path, options = {}) {
       continue;
     }
 
-    // 2xx: read once and return parsed body + status.
-    // non-2xx: read once, return parsed body + status — caller decides what to do.
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
@@ -52,11 +50,57 @@ async function hubspotFetch(path, options = {}) {
 }
 
 /**
- * Preflight validator. Every input MUST have a non-empty idProperty value,
- * otherwise the batch upsert will either fail opaquely or create orphans.
- *
- * Returns { valid, invalid } — invalid rows should be quarantined with a
- * validation error; only valid rows are sent to HubSpot.
+ * Coerce a raw staging-table value (always TEXT) into the type HubSpot expects.
+ * Returns null for empty/missing values so they don't get sent as empty strings.
+ */
+function coerceByType(value, type) {
+  if (value === null || value === undefined || value === '') return null;
+  switch (type) {
+    case 'number':      return normalizeNumber(String(value));
+    case 'bool':        return normalizeBoolean(String(value));
+    case 'date':        return normalizeDate(String(value));
+    case 'enumeration': return String(value);
+    case 'string':
+    default:            return String(value);
+  }
+}
+
+/**
+ * Special-case the Deceased flag — source uses a literal space character
+ * for "alive," which normalizeBoolean would treat as false (correct) but
+ * we keep the dedicated function to preserve the original CLAUDE.md rule.
+ */
+function coerceDeceased(value) {
+  return normalizeDeceased(String(value ?? ''));
+}
+
+/**
+ * Build a HubSpot-ready payload from a staging row using the mapping's
+ * type hints. Drops nulls and internal columns.
+ */
+function buildPayload(row, fields) {
+  const props = {};
+  for (const { prop, type } of fields) {
+    let v = row[prop];
+    // Special handling for the Deceased property (space='alive').
+    if (prop === 'deceased_flag_yn') {
+      v = coerceDeceased(v);
+    } else if (prop === 'email') {
+      v = normalizeEmail(String(v ?? ''));
+    } else {
+      v = coerceByType(v, type);
+    }
+    if (v !== null && v !== undefined) {
+      props[prop] = v;
+    }
+  }
+  return props;
+}
+
+/**
+ * Validate that every input has its unique idProperty value. Anything
+ * missing is caught BEFORE we call HubSpot and returned as invalidInputs
+ * so the caller can quarantine it.
  */
 function validateBatchInputs(inputs, idProperty) {
   const valid = [];
@@ -64,10 +108,7 @@ function validateBatchInputs(inputs, idProperty) {
   for (const input of inputs) {
     const val = input?.properties?.[idProperty];
     if (val === undefined || val === null || val === '') {
-      invalid.push({
-        reason: `Missing idProperty value (${idProperty})`,
-        input,
-      });
+      invalid.push({ reason: `Missing idProperty value (${idProperty})`, input });
     } else {
       valid.push(input);
     }
@@ -76,11 +117,11 @@ function validateBatchInputs(inputs, idProperty) {
 }
 
 /**
- * Upsert a batch of records. Returns per-input outcome:
- *   { succeeded: [{ sourceKey, hubspotId, wasNew }], failed: [{ sourceKey, reason }] }
- *
- * Records are matched between input and response via the idProperty value.
- * Anything in input that isn't echoed back in the response is treated as failed.
+ * Batch upsert. Returns per-input outcome:
+ *   succeeded: [{ sourceKey, hubspotId, wasNew }]
+ *   failed:    [{ sourceKey, reason }]
+ * Any input whose idProperty value isn't echoed back in the response is
+ * treated as failed — we never silently assume success.
  */
 async function batchUpsert(objectType, idProperty, inputs) {
   const succeeded = [];
@@ -88,118 +129,82 @@ async function batchUpsert(objectType, idProperty, inputs) {
 
   for (let i = 0; i < inputs.length; i += BATCH_SIZE) {
     const batch = inputs.slice(i, i + BATCH_SIZE);
-    const endpoint = `/crm/v3/objects/${objectType}/batch/upsert`;
-
-    // Build the set of keys we sent, so we can identify what came back and what didn't.
     const sentKeys = new Set(batch.map(b => b.properties?.[idProperty]).filter(Boolean));
 
     let response;
     try {
-      response = await hubspotFetch(endpoint, {
+      response = await hubspotFetch(`/crm/v3/objects/${objectType}/batch/upsert`, {
         method: 'POST',
         body: JSON.stringify({ inputs: batch, idProperty }),
       });
     } catch (err) {
-      // Network-level or retry-exhausted failure — entire batch failed.
-      for (const key of sentKeys) {
-        failed.push({
-          sourceKey: key,
-          reason: `Batch request failed: ${err.message}`,
-        });
-      }
+      for (const k of sentKeys) failed.push({ sourceKey: k, reason: `Batch request failed: ${err.message}` });
       continue;
     }
 
-    // 2xx: process the results array and mark success per-record.
     if (response.ok) {
       const results = Array.isArray(response.body?.results) ? response.body.results : [];
       const returnedKeys = new Set();
       for (const r of results) {
-        const key = r?.properties?.[idProperty];
-        if (!key) continue;
-        returnedKeys.add(key);
-        succeeded.push({
-          sourceKey: key,
-          hubspotId: r.id,
-          wasNew: !!r.new,
-        });
+        const k = r?.properties?.[idProperty];
+        if (!k) continue;
+        returnedKeys.add(k);
+        succeeded.push({ sourceKey: k, hubspotId: r.id, wasNew: !!r.new });
       }
-      // Any sent key not echoed back = failed silently. Record as failure.
-      for (const key of sentKeys) {
-        if (!returnedKeys.has(key)) {
-          failed.push({
-            sourceKey: key,
-            reason: `HubSpot did not echo back idProperty value — record not confirmed`,
-          });
+      for (const k of sentKeys) {
+        if (!returnedKeys.has(k)) {
+          failed.push({ sourceKey: k, reason: `HubSpot did not echo back idProperty — record not confirmed` });
         }
       }
     } else {
-      // 4xx/5xx — the whole batch failed. Record all inputs as failed with the API error.
       const errMsg = response.body?.message || response.body?.raw || `HTTP ${response.status}`;
-      for (const key of sentKeys) {
-        failed.push({
-          sourceKey: key,
-          reason: `HubSpot ${response.status}: ${errMsg}`,
-        });
-      }
+      for (const k of sentKeys) failed.push({ sourceKey: k, reason: `HubSpot ${response.status}: ${errMsg}` });
     }
 
-    console.log(
-      `Batch upsert ${objectType} [${i}-${i + batch.length}]: ` +
-      `${succeeded.length} cum. ok, ${failed.length} cum. failed`
-    );
+    console.log(`Batch upsert ${objectType} [${i}-${i + batch.length}]: running totals ok=${succeeded.length} failed=${failed.length}`);
   }
 
   return { succeeded, failed };
 }
 
-function stripNullProps(input) {
-  for (const [k, v] of Object.entries(input.properties)) {
-    if (v === null || v === undefined) delete input.properties[k];
-  }
-  return input;
-}
+/**
+ * Generic sync: takes staging rows, a fields list, HubSpot object ID, and
+ * an idProperty. Returns { succeeded, failed, invalidInputs }.
+ */
+async function syncRows(rows, fields, objectType, idProperty) {
+  const inputs = rows.map(row => ({
+    idProperty,
+    id: row[idProperty],
+    properties: buildPayload(row, fields),
+  }));
 
-// Each sync function returns { succeeded, failed, invalidInputs }.
-// invalidInputs are records that failed preflight (missing idProperty).
-
-function buildInputs(rows, normalizer, idProperty) {
-  return rows.map(row => {
-    const n = normalizer(row);
-    return stripNullProps({
-      idProperty,
-      id: n[idProperty],
-      properties: { ...n },
-    });
-  });
-}
-
-async function syncHubspot(objectType, idProperty, rows, normalizer) {
-  const inputs = buildInputs(rows, normalizer, idProperty);
   const { valid, invalid } = validateBatchInputs(inputs, idProperty);
   const { succeeded, failed } = valid.length > 0
     ? await batchUpsert(objectType, idProperty, valid)
     : { succeeded: [], failed: [] };
+
   return { succeeded, failed, invalidInputs: invalid };
 }
 
-async function syncCifContacts(rows)  { return syncHubspot('contacts',               'cif_number',   rows, normalizeCifContact); }
-async function syncCifCompanies(rows) { return syncHubspot('companies',              'cif_number',   rows, normalizeCifCompany); }
-async function syncDda(rows)          { return syncHubspot(CUSTOM_OBJECTS.dda,        'primary_key',  rows, normalizeDda); }
-async function syncLoans(rows)        { return syncHubspot(CUSTOM_OBJECTS.loans,      'primary_key',  rows, normalizeLoan); }
-async function syncCds(rows)          { return syncHubspot(CUSTOM_OBJECTS.cd,         'primary_key',  rows, normalizeCd); }
-async function syncDebitCards(rows)   { return syncHubspot(CUSTOM_OBJECTS.debit_cards, 'composite_key', rows, normalizeDebitCard); }
+// Exported per-table sync functions — each one is a thin wrapper around syncRows.
+async function syncContacts(rows)     { return syncRows(rows, CIF_CONTACT_FIELDS, 'contacts', 'cif_number'); }
+async function syncCompanies(rows)    { return syncRows(rows, CIF_COMPANY_FIELDS, 'companies', 'cif_number'); }
+async function syncDeposits(rows)     { return syncRows(rows, TABLES.dda.fields, TABLES.dda.object, TABLES.dda.idProperty); }
+async function syncLoans(rows)        { return syncRows(rows, TABLES.loans.fields, TABLES.loans.object, TABLES.loans.idProperty); }
+async function syncTimeDeposits(rows) { return syncRows(rows, TABLES.cd.fields, TABLES.cd.object, TABLES.cd.idProperty); }
+async function syncDebitCards(rows)   { return syncRows(rows, TABLES.debit_cards.fields, TABLES.debit_cards.object, TABLES.debit_cards.idProperty); }
 
 module.exports = {
   hubspotFetch,
   batchUpsert,
   validateBatchInputs,
-  syncCifContacts,
-  syncCifCompanies,
-  syncDda,
+  buildPayload,
+  syncContacts,
+  syncCompanies,
+  syncDeposits,
   syncLoans,
-  syncCds,
+  syncTimeDeposits,
   syncDebitCards,
-  CUSTOM_OBJECTS,
   BATCH_SIZE,
+  INTERNAL_COLUMNS,
 };

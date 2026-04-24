@@ -1,109 +1,109 @@
 const fs = require('fs');
 const crypto = require('crypto');
+const { Transform } = require('stream');
 const { parse } = require('csv-parse');
 const { pool } = require('../../db/init');
+const {
+  TABLES,
+  CIF_CONTACT_FIELDS,
+  CIF_COMPANY_FIELDS,
+  classifyCifRow,
+} = require('../transform/hubspot-mapping');
 
-// Expected headers per table for validation
-const EXPECTED_HEADERS = {
-  cif: ['FirstName', 'LastName', 'FullName', 'Birthday', 'Address1', 'Address2', 'City', 'State', 'ZipCode', 'Email', 'HashSSN', 'CIFNum', 'PrivBanking', 'DoNotCall', 'Age', 'Minor', 'InsiderCode', 'InsufficientAddress', 'CLFFlag', 'CivAtWork', 'OrigCustDate', 'Deceased', 'Sex', 'ClassCode', 'TaxIdType', 'CustRelNum', 'DigBank', 'NAICSCode', 'TM', 'ATMDebitCard', 'Q2userID', 'LastLogin', 'RecurTrans', 'PhoneNumber', 'StmtType', 'EnrollmentDt', 'CentralGroupID', 'TextOptIn', 'DiscAcpt'],
-  dda: ['PrimaryKey', 'Acctlast4', 'CIF#', 'InterestRate', 'accttype', 'acctdesc', 'opendate', 'closedate', 'slsassoc', 'dtlastactive', 'currentbal', 'yestbal', 'branchnum', 'officrcode', 'acctstatus', 'relationship', 'promocode', 'openonline'],
-  loans: ['PrimaryKey', 'acctlast4', 'CIFNum', 'InterestRate', 'accttype', 'loantype', 'origdate', 'maturitydate', 'slsassoc', 'lastactivedate', 'currbal', 'branchnum', 'officrcode', 'acctstatus', 'relationship', 'origbal'],
-  cd: ['PrimaryKey', 'AcctLast4', 'CIFNum', 'InterestRate', 'accttype', 'acctdesc', 'issuedate', 'maturitydate', 'slsassoc', 'currbal', 'branchnum', 'officrcode', 'acctstatus', 'relationship', 'openonline'],
-  debit_cards: ['CIF#', 'Acctlast4', 'AcctType', 'Last4DebitCard', 'CardStatus', 'Expiredate', 'Lastuseddt', 'POSLast30Days', 'ActivePOS'],
-};
+/**
+ * QuoteFixer — stream transform that rewrites RFC-non-compliant CSV
+ * from Silver Lake (unescaped double-quotes inside quoted fields, e.g.
+ * `"405 "I" Street"`) into RFC-4180-compliant CSV by doubling any quote
+ * that appears mid-field.
+ *
+ * State machine:
+ *   inQuote = false → copy bytes through; flip to true on every `"`
+ *   inQuote = true  → `"` is ambiguous:
+ *     - followed by delimiter/newline/EOF ⇒ true close-quote (flip to false)
+ *     - followed by another `"`          ⇒ already-escaped (pass both through)
+ *     - otherwise                         ⇒ embedded unescaped quote — double it
+ *
+ * Without this, a single bad address halts the entire CIF parse.
+ */
+class QuoteFixer extends Transform {
+  constructor(opts) {
+    super(opts);
+    this.inQuote = false;
+    this.buf = '';
+    this.fixCount = 0;
+  }
+  _transform(chunk, enc, cb) {
+    const s = this.buf + chunk.toString('utf8');
+    let out = '';
+    let i = 0;
+    // Process all but the last char so we always have a lookahead.
+    while (i < s.length - 1) {
+      const c = s[i], n = s[i + 1];
+      if (!this.inQuote) {
+        out += c;
+        if (c === '"') this.inQuote = true;
+      } else {
+        if (c === '"') {
+          if (n === ',' || n === '\n' || n === '\r') {
+            out += c;
+            this.inQuote = false;
+          } else if (n === '"') {
+            out += c + n;
+            i++;
+          } else {
+            out += c + c;
+            this.fixCount++;
+          }
+        } else {
+          out += c;
+        }
+      }
+      i++;
+    }
+    this.buf = s.substring(i);
+    cb(null, out);
+  }
+  _flush(cb) {
+    cb(null, this.buf);
+  }
+}
 
-// Column name mapping: CSV header -> staging table column
-const COLUMN_MAP = {
-  'CIF#': 'cif_number',
-  'CIFNum': 'cif_number',
-  'FirstName': 'firstname',
-  'LastName': 'lastname',
-  'FullName': 'fullname',
-  'Birthday': 'birthday',
-  'Address1': 'address1',
-  'Address2': 'address2',
-  'City': 'city',
-  'State': 'state',
-  'ZipCode': 'zipcode',
-  'Email': 'email',
-  'HashSSN': 'hashssn',
-  'PrivBanking': 'privbanking',
-  'DoNotCall': 'donotcall',
-  'Age': 'age',
-  'Minor': 'minor',
-  'InsiderCode': 'insidercode',
-  'InsufficientAddress': 'insufficientaddress',
-  'CLFFlag': 'clfflag',
-  'CivAtWork': 'civatwork',
-  'OrigCustDate': 'origcustdate',
-  'Deceased': 'deceased',
-  'Sex': 'sex',
-  'ClassCode': 'classcode',
-  'TaxIdType': 'taxidtype',
-  'CustRelNum': 'custrelnum',
-  'DigBank': 'digbank',
-  'NAICSCode': 'naicscode',
-  'TM': 'tm',
-  'ATMDebitCard': 'atmdebitcard',
-  'Q2userID': 'q2userid',
-  'LastLogin': 'lastlogin',
-  'RecurTrans': 'recurtrans',
-  'PhoneNumber': 'phonenumber',
-  'StmtType': 'stmttype',
-  'EnrollmentDt': 'enrollmentdt',
-  'CentralGroupID': 'centralgroupid',
-  'TextOptIn': 'textoptin',
-  'DiscAcpt': 'discacpt',
-  'PrimaryKey': 'primarykey',
-  'Acctlast4': 'acctlast4',
-  'AcctLast4': 'acctlast4',
-  'InterestRate': 'interestrate',
-  'accttype': 'accttype',
-  'AcctType': 'accttype',
-  'acctdesc': 'acctdesc',
-  'opendate': 'opendate',
-  'closedate': 'closedate',
-  'slsassoc': 'slsassoc',
-  'dtlastactive': 'dtlastactive',
-  'currentbal': 'currentbal',
-  'yestbal': 'yestbal',
-  'branchnum': 'branchnum',
-  'officrcode': 'officrcode',
-  'acctstatus': 'acctstatus',
-  'relationship': 'relationship',
-  'promocode': 'promocode',
-  'openonline': 'openonline',
-  'loantype': 'loantype',
-  'origdate': 'origdate',
-  'maturitydate': 'maturitydate',
-  'lastactivedate': 'lastactivedate',
-  'currbal': 'currbal',
-  'origbal': 'origbal',
-  'issuedate': 'issuedate',
-  'Last4DebitCard': 'last4debitcard',
-  'CardStatus': 'cardstatus',
-  'Expiredate': 'expiredate',
-  'Lastuseddt': 'lastuseddt',
-  'POSLast30Days': 'poslast30days',
-  'ActivePOS': 'activepos',
-};
+/**
+ * Derive expected headers for a source from the mapping module.
+ * For CIF, use the union of contact + company CSV columns since the
+ * raw CSV doesn't know which row is which yet.
+ */
+function expectedHeadersFor(source) {
+  if (source === 'cif') {
+    const set = new Set();
+    for (const f of CIF_CONTACT_FIELDS) set.add(f.csv);
+    for (const f of CIF_COMPANY_FIELDS) set.add(f.csv);
+    return Array.from(set);
+  }
+  return TABLES[source].fields.map(f => f.csv);
+}
 
 function generateRowHash(values) {
   return crypto.createHash('sha256').update(values.join('|')).digest('hex');
 }
 
-function generateCompositeKey(row) {
-  const cif = row['CIF#'] || '';
-  const acct = row['Acctlast4'] || '';
-  const type = row['AcctType'] || '';
+function generateCompositeKeyFromRaw(row) {
+  const cif  = row['CIF#']           || '';
+  const acct = row['Acctlast4']      || '';
+  const type = row['AcctType']       || '';
   const card = row['Last4DebitCard'] || '';
-  const exp = row['Expiredate'] || '';
+  const exp  = row['Expiredate']     || '';
   return `${cif}${acct}${type}${card}${exp}`;
 }
 
 function hashFile(filePath) {
-  const content = fs.readFileSync(filePath);
-  return crypto.createHash('sha256').update(content).digest('hex');
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (c) => hash.update(c));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
 }
 
 function validateHeaders(actual, expected) {
@@ -115,110 +115,142 @@ function validateHeaders(actual, expected) {
   return trimmedActual;
 }
 
-async function parseAndStage(filePath, tableName) {
-  const expected = EXPECTED_HEADERS[tableName];
-  if (!expected) {
-    throw new Error(`Unknown table name: ${tableName}`);
+/**
+ * Map a raw CSV row into an object keyed by HubSpot property names,
+ * using the supplied field list. Any field in the list whose CSV column
+ * isn't in the row gets null. Fields in the row that aren't in the list
+ * are dropped.
+ */
+function mapRowToHubspotProps(row, fieldList) {
+  const out = {};
+  for (const { csv, prop } of fieldList) {
+    const v = row[csv];
+    out[prop] = (v === undefined || v === null || v === '') ? null : v;
   }
+  return out;
+}
 
-  const fileHash = hashFile(filePath);
-  const stagingTable = `stg_${tableName}`;
+/**
+ * Parse a CSV and stage it into the appropriate Postgres staging table(s).
+ *
+ *   source === 'cif'          → routes to stg_contacts or stg_companies per row
+ *   source === 'dda'          → stg_deposits
+ *   source === 'loans'        → stg_loans
+ *   source === 'cd'           → stg_time_deposits
+ *   source === 'debit_cards'  → stg_debit_cards
+ *
+ * Returns a summary { rowCount, fileHash, byTable: { stg_contacts: N, ... }, unclassified: [...] }.
+ */
+async function parseAndStage(filePath, source) {
+  const expected = expectedHeadersFor(source);
+  const fileHash = await hashFile(filePath);
+
+  // Buckets to collect rows per target staging table.
+  const buckets = {};
+  const unclassified = [];  // raw rows that classifyCifRow returns 'unclassified' for
+  let rowCount = 0;
+
+  // Track rows we had to skip at the parser level (malformed CSV — NOT silent).
+  const parseSkipped = [];
+  const quoteFixer = new QuoteFixer();
+
+  const parser = fs.createReadStream(filePath)
+    .pipe(quoteFixer)
+    .pipe(parse({
+      columns: true,
+      trim: true,
+      skip_empty_lines: true,
+      relax_column_count: true,
+      skip_records_with_error: true,
+    }));
+
+  parser.on('skip', (err) => {
+    const msg = err && err.message ? err.message : 'unknown parse error';
+    parseSkipped.push({ message: msg, at: err?.lines });
+    console.warn(`⚠  CSV row skipped (line ${err?.lines ?? '?'}): ${msg}`);
+  });
 
   return new Promise((resolve, reject) => {
-    const rows = [];
-    let rowCount = 0;
-    let headersValidated = false;
-
-    const parser = fs.createReadStream(filePath).pipe(
-      parse({
-        columns: true,
-        trim: true,
-        skip_empty_lines: true,
-        relax_column_count: true,
-      })
-    );
-
     parser.on('headers', (headers) => {
-      try {
-        validateHeaders(headers, expected);
-        headersValidated = true;
-      } catch (err) {
-        parser.destroy(err);
-      }
+      try { validateHeaders(headers, expected); }
+      catch (e) { parser.destroy(e); }
     });
 
-    parser.on('data', (row) => {
+    parser.on('data', (rawRow) => {
       rowCount++;
 
-      // Trim all values
-      const trimmed = {};
-      for (const [key, val] of Object.entries(row)) {
-        trimmed[key] = typeof val === 'string' ? val.trim() : val;
+      // Trim string values in place.
+      for (const k of Object.keys(rawRow)) {
+        if (typeof rawRow[k] === 'string') rawRow[k] = rawRow[k].trim();
       }
 
-      // Generate row hash from all values
-      const rowHash = generateRowHash(Object.values(trimmed));
+      // row_hash computed over the ORIGINAL raw CSV values (sorted for stability).
+      const rowHashInput = Object.keys(rawRow).sort().map(k => `${k}=${rawRow[k] ?? ''}`).join('|');
+      const rowHash = crypto.createHash('sha256').update(rowHashInput).digest('hex');
 
-      // Map CSV column names to staging column names
-      const mapped = {};
-      for (const [csvCol, value] of Object.entries(trimmed)) {
-        const dbCol = COLUMN_MAP[csvCol.trim()];
-        if (dbCol) {
-          mapped[dbCol] = value;
+      if (source === 'cif') {
+        const cls = classifyCifRow(rawRow);
+        if (cls === 'unclassified') {
+          unclassified.push(rawRow);
+          return;
         }
+        const targetTable = cls === 'contact' ? 'stg_contacts' : 'stg_companies';
+        const fields = cls === 'contact' ? CIF_CONTACT_FIELDS : CIF_COMPANY_FIELDS;
+        const mapped = mapRowToHubspotProps(rawRow, fields);
+        mapped.row_hash = rowHash;
+        (buckets[targetTable] ||= []).push(mapped);
+        return;
       }
 
-      // Normalize CIF# -> cif_number for DDA and debit_cards
-      if (tableName === 'dda' || tableName === 'debit_cards') {
-        mapped.cif_number = trimmed['CIF#'] || '';
+      const config = TABLES[source];
+      const mapped = mapRowToHubspotProps(rawRow, config.fields);
+      if (source === 'debit_cards') {
+        mapped.composite_key = generateCompositeKeyFromRaw(rawRow);
       }
-
-      // Generate composite key for debit cards
-      if (tableName === 'debit_cards') {
-        mapped.composite_key = generateCompositeKey(trimmed);
-      }
-
       mapped.row_hash = rowHash;
-      rows.push(mapped);
+      (buckets[config.staging] ||= []).push(mapped);
     });
 
     parser.on('end', async () => {
       try {
-        await insertRows(stagingTable, rows, tableName);
-        resolve({ rowCount, fileHash, tableName });
-      } catch (err) {
-        reject(err);
-      }
+        const byTable = {};
+        for (const [table, rows] of Object.entries(buckets)) {
+          await insertRows(table, rows);
+          byTable[table] = rows.length;
+        }
+        if (quoteFixer.fixCount > 0) {
+          console.warn(`⚠  QuoteFixer repaired ${quoteFixer.fixCount} embedded quotes in ${filePath}`);
+        }
+        resolve({ rowCount, fileHash, byTable, unclassified, parseSkipped, quotesFixed: quoteFixer.fixCount });
+      } catch (err) { reject(err); }
     });
 
     parser.on('error', reject);
   });
 }
 
-async function insertRows(stagingTable, rows, tableName) {
+async function insertRows(stagingTable, rows) {
   if (rows.length === 0) return;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Clear existing staging data for this table
+    // Staging is ephemeral — rebuilt every run. Diff engine uses shipped_records as the
+    // audit ledger, so this DELETE does not cause the "everything looks new" bug from before.
     await client.query(`DELETE FROM ${stagingTable}`);
 
-    // Batch insert in chunks of 500
+    // Determine the column set from the first row — we built these uniformly in the caller.
+    const columns = Object.keys(rows[0]);
     const chunkSize = 500;
     for (let i = 0; i < rows.length; i += chunkSize) {
       const chunk = rows.slice(i, i + chunkSize);
-      const columns = Object.keys(chunk[0]);
-      const valuePlaceholders = chunk.map((_, rowIdx) => {
-        const offset = rowIdx * columns.length;
-        return `(${columns.map((_, colIdx) => `$${offset + colIdx + 1}`).join(', ')})`;
+      const placeholders = chunk.map((_, ri) => {
+        const off = ri * columns.length;
+        return `(${columns.map((_, ci) => `$${off + ci + 1}`).join(', ')})`;
       }).join(', ');
-
-      const values = chunk.flatMap(row => columns.map(col => row[col] || null));
-
+      const values = chunk.flatMap(r => columns.map(c => r[c] ?? null));
       await client.query(
-        `INSERT INTO ${stagingTable} (${columns.join(', ')}) VALUES ${valuePlaceholders}`,
+        `INSERT INTO ${stagingTable} (${columns.join(', ')}) VALUES ${placeholders}`,
         values
       );
     }
@@ -237,7 +269,6 @@ module.exports = {
   parseAndStage,
   hashFile,
   generateRowHash,
-  generateCompositeKey,
   validateHeaders,
-  EXPECTED_HEADERS,
+  expectedHeadersFor,
 };
