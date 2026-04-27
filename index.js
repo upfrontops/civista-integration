@@ -16,6 +16,22 @@ const { describeError } = require('./src/monitoring/errors');
 // Forward all console output to SSE subscribers so the UI log panel sees it.
 installConsoleHook();
 
+// Surface async crashes that would otherwise be invisible to the UI log stream.
+// console.error is hooked above, so these land in /api/stream too.
+process.on('unhandledRejection', (reason) => {
+  const msg = describeError(reason);
+  console.error(`╔ UNHANDLED PROMISE REJECTION ════════════════════════════════════╗`);
+  console.error(`║ ${msg}`);
+  if (reason && reason.stack) console.error(reason.stack);
+  console.error(`╚═════════════════════════════════════════════════════════════════╝`);
+});
+process.on('uncaughtException', (err) => {
+  console.error(`╔ UNCAUGHT EXCEPTION ═════════════════════════════════════════════╗`);
+  console.error(`║ ${describeError(err)}`);
+  if (err && err.stack) console.error(err.stack);
+  console.error(`╚═════════════════════════════════════════════════════════════════╝`);
+});
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -109,8 +125,12 @@ app.post('/api/sftp-upload', upload.single('file'), async (req, res) => {
     console.warn(`SFTP upload failed for ${remoteName}: ${e.message}`);
     res.status(502).json({ error: e.message });
   } finally {
-    // Clean up the temp upload file
-    fs.unlink(req.file.path, () => {});
+    // Clean up the temp upload file. Log if it fails so we don't quietly leak tmpfs.
+    fs.unlink(req.file.path, (err) => {
+      if (err && err.code !== 'ENOENT') {
+        console.warn(`Failed to clean tmp upload ${req.file.path}: ${err.code || err.message}`);
+      }
+    });
   }
 });
 
@@ -138,16 +158,26 @@ app.get('/api/stream', (req, res) => {
   });
   res.flushHeaders();
   res.write('retry: 3000\n\n');
+  let detached = false;
+  const detach = () => {
+    if (detached) return;
+    detached = true;
+    eventStream.off('log', send);
+  };
   const send = (payload) => {
+    if (detached) return;
     try {
       res.write(`event: log\ndata: ${JSON.stringify(payload)}\n\n`);
-    } catch {
-      // client disconnected
+    } catch (e) {
+      // Likely client disconnect mid-write — detach so we don't leak listeners
+      // and keep emitting into a dead socket on every future log event.
+      detach();
     }
   };
   send({ level: 'info', message: 'SSE log stream connected', at: new Date().toISOString() });
   eventStream.on('log', send);
-  req.on('close', () => { eventStream.off('log', send); });
+  req.on('close', detach);
+  res.on('error', detach);
 });
 
 // -------------------- Schema check (live HubSpot + Postgres) --------------------
@@ -183,20 +213,48 @@ app.get('/api/schema-check', async (req, res) => {
 
     const objects = [];
     for (const o of SCHEMA_OBJECTS) {
+      const objectErrors = [];
+
       // Postgres columns
-      const pgCols = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
-        [o.stagingTable]
-      );
+      let pgCols;
+      try {
+        pgCols = await pool.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+          [o.stagingTable]
+        );
+      } catch (e) {
+        const msg = `Postgres column lookup failed: ${describeError(e)}`;
+        console.error(`schema-check[${o.label}] ${msg}`);
+        objects.push({ label: o.label, stagingTable: o.stagingTable, hsObject: o.hsObject,
+          matched: 0, missingInHs: 0, missingInPg: 0,
+          pgRowCount: null, hsRowCount: null, csvRowCount: null,
+          fields: [], errors: [msg] });
+        continue;
+      }
       const pgColSet = new Set(pgCols.rows.map(r => r.column_name));
       const internal = new Set(['id', 'row_hash', 'loaded_at', 'synced_at']);
 
-      // HubSpot properties
-      const hsRes = await fetch(`https://api.hubapi.com/crm/v3/properties/${o.hsObject}`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
-      });
-      const hsBody = await hsRes.json();
-      const hsProps = Array.isArray(hsBody.results) ? hsBody.results : [];
+      // HubSpot properties — must surface failures, not silently treat 401 as "0 properties".
+      let hsProps = [];
+      try {
+        const hsRes = await fetch(`https://api.hubapi.com/crm/v3/properties/${o.hsObject}`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        const hsText = await hsRes.text();
+        let hsBody = {};
+        try { hsBody = JSON.parse(hsText); } catch { hsBody = { raw: hsText }; }
+        if (!hsRes.ok) {
+          const msg = `HubSpot ${hsRes.status} on /properties/${o.hsObject}: ${hsBody.message || hsBody.raw || 'no body'}`;
+          console.error(`schema-check[${o.label}] ${msg}`);
+          objectErrors.push(msg);
+        } else {
+          hsProps = Array.isArray(hsBody.results) ? hsBody.results : [];
+        }
+      } catch (e) {
+        const msg = `HubSpot fetch failed for ${o.hsObject}: ${describeError(e)}`;
+        console.error(`schema-check[${o.label}] ${msg}`);
+        objectErrors.push(msg);
+      }
       const hsPropMap = new Map(hsProps.map(p => [p.name, p]));
 
       // Diff: for each non-internal PG column, find matching HS property.
@@ -221,14 +279,18 @@ app.get('/api/schema-check', async (req, res) => {
         missingInPg++;
       }
 
-      // Postgres row count
-      let pgCount = 0;
+      // Postgres row count — distinguish "missing table" from "query failed".
+      let pgCount = null;
       try {
         const c = await pool.query(`SELECT COUNT(*)::int AS c FROM ${o.stagingTable}`);
         pgCount = c.rows[0].c;
-      } catch { /* table may not exist yet */ }
+      } catch (e) {
+        const msg = `Postgres row count failed on ${o.stagingTable}: ${describeError(e)}`;
+        console.error(`schema-check[${o.label}] ${msg}`);
+        objectErrors.push(msg);
+      }
 
-      // HubSpot total (search API returns total)
+      // HubSpot total (search API returns total) — must surface 4xx/5xx, not pretend "—".
       let hsCount = null;
       try {
         const sr = await fetch(`https://api.hubapi.com/crm/v3/objects/${o.hsObject}/search`, {
@@ -236,13 +298,32 @@ app.get('/api/schema-check', async (req, res) => {
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ limit: 1 }),
         });
-        const sb = await sr.json();
-        hsCount = sb.total ?? null;
-      } catch {}
+        const srText = await sr.text();
+        let sb = {};
+        try { sb = JSON.parse(srText); } catch { sb = { raw: srText }; }
+        if (!sr.ok) {
+          const msg = `HubSpot ${sr.status} on search ${o.hsObject}: ${sb.message || sb.raw || 'no body'}`;
+          console.error(`schema-check[${o.label}] ${msg}`);
+          objectErrors.push(msg);
+        } else {
+          hsCount = sb.total ?? null;
+        }
+      } catch (e) {
+        const msg = `HubSpot search failed for ${o.hsObject}: ${describeError(e)}`;
+        console.error(`schema-check[${o.label}] ${msg}`);
+        objectErrors.push(msg);
+      }
 
       // CSV row count if file is in /incoming/
       const csvPath = path.join(INCOMING_DIR, o.csvFile);
-      const csvCount = await countCsvRows(csvPath);
+      let csvCount = null;
+      try {
+        csvCount = await countCsvRows(csvPath);
+      } catch (e) {
+        const msg = `CSV row count failed for ${o.csvFile}: ${describeError(e)}`;
+        console.warn(`schema-check[${o.label}] ${msg}`);
+        objectErrors.push(msg);
+      }
 
       objects.push({
         label: o.label,
@@ -250,9 +331,10 @@ app.get('/api/schema-check', async (req, res) => {
         hsObject: o.hsObject,
         matched, missingInHs, missingInPg,
         pgRowCount: pgCount,
-        hsRowCount: hsCount === null ? '—' : hsCount,
+        hsRowCount: hsCount,
         csvRowCount: csvCount,
         fields: rows,
+        errors: objectErrors,
       });
     }
     res.json({ objects });

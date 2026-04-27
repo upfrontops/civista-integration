@@ -91,10 +91,15 @@ function startSftpServer(options = {}) {
             const handle = Buffer.alloc(4);
             const filePath = path.join(incomingDir, path.basename(filename));
             handle.writeUInt32BE(handleCount++);
-            openFiles.set(handle.toString('hex'), {
-              path: filePath,
-              stream: fs.createWriteStream(filePath),
+            const stream = fs.createWriteStream(filePath);
+            const entry = { path: filePath, stream, writeError: null };
+            // Capture any disk error so we can fail the next WRITE/CLOSE loudly
+            // instead of returning OK on a stream that's actually broken.
+            stream.on('error', (err) => {
+              entry.writeError = err;
+              console.error(`✘ SFTP write stream error for ${path.basename(filePath)}: ${err.code || err.message}`);
             });
+            openFiles.set(handle.toString('hex'), entry);
             sftp.handle(reqid, handle);
           });
 
@@ -104,21 +109,60 @@ function startSftpServer(options = {}) {
               sftp.status(reqid, 4); // FAILURE
               return;
             }
-            file.stream.write(data);
-            sftp.status(reqid, 0); // OK
+            if (file.writeError) {
+              sftp.status(reqid, 4, `disk write failed: ${file.writeError.code || file.writeError.message}`);
+              return;
+            }
+            // Wait for the write to actually be accepted before reporting OK.
+            // Without this, the client thinks the byte range succeeded while the
+            // stream may be buffering or about to error.
+            file.stream.write(data, (err) => {
+              if (err) {
+                file.writeError = err;
+                console.error(`✘ SFTP WRITE failed on ${path.basename(file.path)}: ${err.code || err.message}`);
+                sftp.status(reqid, 4, `write failed: ${err.code || err.message}`);
+              } else {
+                sftp.status(reqid, 0); // OK
+              }
+            });
           });
 
           sftp.on('CLOSE', (reqid, handle) => {
-            const file = openFiles.get(handle.toString('hex'));
-            if (file) {
-              file.stream.end();
-              openFiles.delete(handle.toString('hex'));
+            const key = handle.toString('hex');
+            const file = openFiles.get(key);
+            if (!file) {
+              sftp.status(reqid, 0);
+              return;
+            }
+            // If we already saw a write error, report failure — and DO NOT fire
+            // onFileReceived (the file is corrupt/incomplete).
+            if (file.writeError) {
+              file.stream.destroy();
+              openFiles.delete(key);
+              console.error(`✘ SFTP CLOSE on ${path.basename(file.path)} after prior error — not delivering`);
+              sftp.status(reqid, 4, `upload aborted: ${file.writeError.code || file.writeError.message}`);
+              return;
+            }
+            // Wait for the stream to fully flush. If 'finish' fires we're OK;
+            // if 'error' fires, the write didn't actually land — surface it.
+            file.stream.end((err) => {
+              openFiles.delete(key);
+              if (err || file.writeError) {
+                const e = err || file.writeError;
+                console.error(`✘ SFTP CLOSE flush failed on ${path.basename(file.path)}: ${e.code || e.message}`);
+                sftp.status(reqid, 4, `flush failed: ${e.code || e.message}`);
+                return;
+              }
               console.log(`SFTP: received ${path.basename(file.path)}`);
               if (onFileReceived) {
-                onFileReceived(file.path);
+                try {
+                  onFileReceived(file.path);
+                } catch (cbErr) {
+                  console.error(`✘ onFileReceived callback threw for ${path.basename(file.path)}: ${cbErr.message}`);
+                }
               }
-            }
-            sftp.status(reqid, 0);
+              sftp.status(reqid, 0);
+            });
           });
         });
       });

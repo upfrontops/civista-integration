@@ -329,12 +329,17 @@ async function loadSchemaCheck() {
         countsEl.appendChild(el('b', {}, label));
         countsEl.appendChild(document.createTextNode(' ' + value + '  '));
       };
-      addPair('PG:', obj.pgRowCount);
-      addPair('HS:', obj.hsRowCount);
+      const fmt = v => (v === null || v === undefined) ? '—' : v;
+      addPair('PG:', fmt(obj.pgRowCount));
+      addPair('HS:', fmt(obj.hsRowCount));
       if (obj.csvRowCount !== null && obj.csvRowCount !== undefined) addPair('CSV:', obj.csvRowCount);
       countsEl.appendChild(document.createTextNode(' — '));
-      countsEl.appendChild(el('span', { className: 'badge ' + (obj.missingInHs > 0 ? 'err' : 'ok') },
-        obj.matched + ' match / ' + obj.missingInHs + ' pg-only / ' + obj.missingInPg + ' hs-only'));
+      const errCount = (obj.errors && obj.errors.length) || 0;
+      const badgeClass = errCount > 0 || obj.missingInHs > 0 ? 'err' : 'ok';
+      const badgeText = errCount > 0
+        ? errCount + ' error' + (errCount === 1 ? '' : 's')
+        : obj.matched + ' match / ' + obj.missingInHs + ' pg-only / ' + obj.missingInPg + ' hs-only';
+      countsEl.appendChild(el('span', { className: 'badge ' + badgeClass }, badgeText));
 
       const summary = el('summary', {},
         el('span', {}, obj.label, ' ',
@@ -342,6 +347,17 @@ async function loadSchemaCheck() {
         countsEl,
       );
       details.appendChild(summary);
+
+      // Loud display of any per-object errors so the user never sees a silent
+      // empty table when HubSpot or Postgres failed.
+      if (errCount > 0) {
+        const errBox = el('div', { style:'padding:10px 14px; color:var(--err); font-family:var(--font-mono); font-size:12px; border-bottom:1px solid var(--border); background:rgba(248,81,73,0.08);' });
+        for (const m of obj.errors) {
+          errBox.appendChild(el('div', {}, '✘ ' + m));
+        }
+        details.appendChild(errBox);
+        details.setAttribute('open', '');
+      }
 
       const table = el('table', { className:'schema-table' });
       const thead = el('thead', {},
