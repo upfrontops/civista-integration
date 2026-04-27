@@ -11,6 +11,7 @@ const { startSftpServer } = require('./src/ingestion/sftp-server');
 const { testAuth, uploadFile } = require('./src/sync/sftp-client');
 const { eventStream, installConsoleHook } = require('./src/monitoring/event-stream');
 const { TABLES, CIF_CONTACT_FIELDS, CIF_COMPANY_FIELDS } = require('./src/transform/hubspot-mapping');
+const { describeError } = require('./src/monitoring/errors');
 
 // Forward all console output to SSE subscribers so the UI log panel sees it.
 installConsoleHook();
@@ -51,7 +52,7 @@ app.get('/health', async (req, res) => {
     const status = await getHealthStatus();
     res.status(200).json(status);
   } catch (err) {
-    res.status(200).json({ status: 'starting', database: 'connecting', error: err.message });
+    res.status(200).json({ status: 'starting', database: 'connecting', error: describeError(err) });
   }
 });
 
@@ -256,8 +257,9 @@ app.get('/api/schema-check', async (req, res) => {
     }
     res.json({ objects });
   } catch (e) {
-    console.error('schema-check failed:', e.message);
-    res.status(500).json({ error: e.message });
+    const msg = describeError(e);
+    console.error('schema-check failed:', msg);
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -288,5 +290,5 @@ app.listen(port, () => {
   console.log(`civista-integration listening on port ${port}`);
   initDb()
     .then(() => console.log('Database initialized'))
-    .catch((err) => console.error('Database init failed (will retry on next request):', err.message));
+    .catch((err) => console.error('Database init failed (will retry on next request):', describeError(err)));
 });

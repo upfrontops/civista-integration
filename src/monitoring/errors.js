@@ -71,4 +71,16 @@ async function countErrorsForRun(runId) {
   return { total, byType: counts };
 }
 
-module.exports = { recordError, recordErrorBatch, countErrorsForRun, ERROR_TYPES };
+// Some errors (notably pg AggregateError on ECONNREFUSED) come back with
+// an empty `.message`. Falling back to .code / nested .errors keeps the
+// failure visible — silent "" responses are a no-ship per CLAUDE.md.
+function describeError(e) {
+  if (!e) return 'unknown error';
+  if (typeof e === 'string') return e;
+  if (e.message) return e.message;
+  if (e.code) return `error code ${e.code}`;
+  if (Array.isArray(e.errors) && e.errors[0]) return describeError(e.errors[0]);
+  try { return JSON.stringify(e); } catch { return String(e); }
+}
+
+module.exports = { recordError, recordErrorBatch, countErrorsForRun, describeError, ERROR_TYPES };
