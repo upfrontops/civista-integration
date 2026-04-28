@@ -266,6 +266,45 @@ async function initDb() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_sync_errors_severity ON sync_errors(severity)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_shipped_hash ON shipped_records(source_table, source_key, row_hash)`);
 
+    // Three-stage hash verification + lossless preservation columns.
+    // row_hash already exists on every staging table (HASH A — sha256 of canonical
+    // CSV row). Add the rest. ALTER...IF NOT EXISTS so this is idempotent for both
+    // fresh installs and existing deployments.
+    const STAGING_TABLES = [
+      'stg_contacts', 'stg_companies', 'stg_deposits',
+      'stg_loans', 'stg_time_deposits', 'stg_debit_cards',
+    ];
+    for (const t of STAGING_TABLES) {
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS raw_csv JSONB`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS db_persist_hash VARCHAR(64)`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS db_verified_at TIMESTAMPTZ`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS hubspot_persist_hash VARCHAR(64)`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS hubspot_verified_at TIMESTAMPTZ`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS hubspot_verify_diff JSONB`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS needs_review BOOLEAN DEFAULT false`);
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_${t}_needs_review ON ${t}(needs_review) WHERE needs_review = true`);
+    }
+
+    // Persistent record of CSV->HubSpot mapping mismatches so the UI can
+    // display them across runs. Populated at startup (one row per send:false
+    // mapping) and at run time (date_coercion warnings increment counts).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS mapping_issues (
+        id SERIAL PRIMARY KEY,
+        source_csv TEXT NOT NULL,
+        source_column TEXT NOT NULL,
+        hs_object TEXT NOT NULL,
+        hs_property TEXT NOT NULL,
+        hs_type TEXT NOT NULL,
+        problem TEXT NOT NULL,
+        sample_value TEXT,
+        rows_affected INTEGER DEFAULT 0,
+        first_seen TIMESTAMPTZ DEFAULT NOW(),
+        last_seen TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(source_csv, source_column, hs_property)
+      );
+    `);
+
     await client.query('COMMIT');
     console.log('Database initialized: all tables created');
   } catch (err) {

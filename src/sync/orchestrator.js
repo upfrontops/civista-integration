@@ -1,10 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('../../db/init');
-const { parseAndStage } = require('../ingestion/csv-parser');
+const { parseAndStage, verifyDbPersistence } = require('../ingestion/csv-parser');
 const { checkCircuitBreaker } = require('../ingestion/circuit-breaker');
 const { getChangedRows, recordShipped } = require('../ingestion/diff-engine');
 const { recordErrorBatch, ERROR_TYPES } = require('../monitoring/errors');
+const loud = require('../monitoring/loud');
 const { TABLES } = require('../transform/hubspot-mapping');
 const {
   syncContacts,
@@ -24,14 +25,15 @@ const FILE_SOURCE_MAP = {
   'HubSpot_Debit_Card.csv': 'debit_cards',
 };
 
-// For each staging table, which HubSpot sync function and which column is the unique id.
+// For each staging table, which HubSpot sync function, which column is the
+// unique id, and which source CSV the rows came from (for loud-event context).
 const STAGING_SYNC = {
-  stg_contacts:      { syncFn: syncContacts,     keyColumn: 'cif_number',    objectLabel: 'contacts' },
-  stg_companies:     { syncFn: syncCompanies,    keyColumn: 'cif_number',    objectLabel: 'companies' },
-  stg_deposits:      { syncFn: syncDeposits,     keyColumn: 'primary_key',   objectLabel: 'deposits' },
-  stg_loans:         { syncFn: syncLoans,        keyColumn: 'primary_key',   objectLabel: 'loans' },
-  stg_time_deposits: { syncFn: syncTimeDeposits, keyColumn: 'primary_key',   objectLabel: 'time_deposits' },
-  stg_debit_cards:   { syncFn: syncDebitCards,   keyColumn: 'composite_key', objectLabel: 'debit_cards' },
+  stg_contacts:      { syncFn: syncContacts,     keyColumn: 'cif_number',    objectLabel: 'contacts',      sourceCsv: 'HubSpot_CIF.csv' },
+  stg_companies:     { syncFn: syncCompanies,    keyColumn: 'cif_number',    objectLabel: 'companies',     sourceCsv: 'HubSpot_CIF.csv' },
+  stg_deposits:      { syncFn: syncDeposits,     keyColumn: 'primary_key',   objectLabel: 'deposits',      sourceCsv: 'HubSpot_DDA.csv' },
+  stg_loans:         { syncFn: syncLoans,        keyColumn: 'primary_key',   objectLabel: 'loans',         sourceCsv: 'HubSpot_Loan.csv' },
+  stg_time_deposits: { syncFn: syncTimeDeposits, keyColumn: 'primary_key',   objectLabel: 'time_deposits', sourceCsv: 'HubSpot_CD.csv' },
+  stg_debit_cards:   { syncFn: syncDebitCards,   keyColumn: 'composite_key', objectLabel: 'debit_cards',   sourceCsv: 'HubSpot_Debit_Card.csv' },
 };
 
 async function createSyncLog(tableName, rowCount, fileHash) {
@@ -61,7 +63,7 @@ async function updateSyncLog(logId, updates) {
  * Assumes staging is already populated by parseAndStage.
  */
 async function syncStagingTable(stagingTable, runId) {
-  const { syncFn, keyColumn, objectLabel } = STAGING_SYNC[stagingTable];
+  const { syncFn, keyColumn, objectLabel, sourceCsv } = STAGING_SYNC[stagingTable];
 
   const { toSync, skipped, nullKeyRows, total } = await getChangedRows(stagingTable, keyColumn);
   console.log(`${stagingTable}: total=${total}, to_sync=${toSync.length}, unchanged=${skipped}, null_key=${nullKeyRows.length}`);
@@ -84,7 +86,11 @@ async function syncStagingTable(stagingTable, runId) {
     const byKey = new Map();
     for (const r of toSync) byKey.set(r[keyColumn], r);
 
-    const { succeeded, failed, invalidInputs } = await syncFn(toSync);
+    const { succeeded, failed, invalidInputs } = await syncFn(toSync, {
+      sourceTable: stagingTable,
+      sourceCsv,
+      runId,
+    });
 
     await recordShipped(stagingTable, succeeded, byKey);
     totalShipped = succeeded.length;
@@ -128,21 +134,27 @@ async function syncFile(source, filePath) {
   // Circuit breaker runs against the source-level row count (the CSV).
   const { rowCount, fileHash, byTable, unclassified } = await parseAndStage(filePath, source);
 
+  // HASH B verification: every staging table touched by this parse needs to
+  // re-read raw_csv and confirm the row hash round-trips. Loud alarm on any
+  // mismatch (loss between CSV and DB).
+  for (const stagingTable of Object.keys(byTable)) {
+    const v = await verifyDbPersistence(stagingTable);
+    console.log(`HASH B verify ${stagingTable}: ${v.ok}/${v.total} ok, ${v.mismatch} mismatch`);
+  }
+
   const cbResult = await checkCircuitBreaker(source, rowCount);
   const results = [];
 
   if (!cbResult.safe) {
-    console.warn(`╔════════════════════════════════════════════════════════════════╗`);
-    console.warn(`║  CIRCUIT BREAKER TRIPPED on ${source.padEnd(38)}║`);
-    console.warn(`║  ${cbResult.reason.padEnd(62)}║`);
-    console.warn(`║  Sync halted for this source. File will be quarantined.       ║`);
-    console.warn(`╚════════════════════════════════════════════════════════════════╝`);
-    // Record one run for the source-as-whole.
+    // Record one run for the source-as-whole, then loud-alarm.
     const runId = await createSyncLog(source, rowCount, fileHash);
-    await recordErrorBatch([{
-      runId, sourceTable: source, errorType: ERROR_TYPES.INFRA,
-      errorMessage: `Circuit breaker: ${cbResult.reason}`,
-    }]);
+    await loud.alarm({
+      event: 'circuit_breaker',
+      message: `${source}: ${cbResult.reason}. Sync halted; file will be quarantined.`,
+      runId,
+      sourceTable: source,
+      context: { previousCount: cbResult.previousCount, currentCount: cbResult.currentCount },
+    });
     await updateSyncLog(runId, {
       records_attempted: 0, records_skipped: rowCount,
       error_details: { circuit_breaker: cbResult.reason },
@@ -159,12 +171,19 @@ async function syncFile(source, filePath) {
   if (source === 'cif' && unclassified.length > 0) {
     // Create an ambient run_id for classification errors (one per source run).
     const runId = await createSyncLog(`${source}:unclassified`, unclassified.length, fileHash);
+    await loud.warn({
+      event: 'unclassified_cif',
+      message: `${unclassified.length} CIF rows could not be classified as contact or company (likely NULL TaxIdType or partial name data)`,
+      runId,
+      sourceTable: 'stg_cif',
+      context: { sample: unclassified.slice(0, 3).map(r => ({ CIFNum: r.CIFNum, TaxIdType: r.TaxIdType, FirstName: r.FirstName, LastName: r.LastName })) },
+    });
     await recordErrorBatch(unclassified.map(r => ({
       runId,
       sourceTable: 'stg_cif',
       sourceKey: r.CIFNum || null,
       errorType: ERROR_TYPES.CLASSIFICATION,
-      errorMessage: 'CIF row could not be classified as contact or company (likely NULL TaxIdType or partial name data)',
+      errorMessage: 'CIF row could not be classified as contact or company',
       recordSnapshot: r,
     })));
     await updateSyncLog(runId, {
@@ -267,10 +286,11 @@ async function runFullSync(incomingDir, archiveDir, quarantineDir) {
 
   for (const filename of syncOrder) {
     if (!files.includes(filename)) {
-      console.warn(`╔════════════════════════════════════════════════════════════════╗`);
-      console.warn(`║  EXPECTED FILE MISSING: ${filename.padEnd(41)}║`);
-      console.warn(`║  (skipping — will not sync this source this run)              ║`);
-      console.warn(`╚════════════════════════════════════════════════════════════════╝`);
+      await loud.warn({
+        event: 'missing_csv',
+        message: `Expected nightly file missing: ${filename}. Skipping this source for this run.`,
+        context: { incomingDir, expectedFiles: syncOrder, found: files },
+      });
       continue;
     }
 

@@ -9,6 +9,18 @@ const {
   CIF_COMPANY_FIELDS,
   classifyCifRow,
 } = require('../transform/hubspot-mapping');
+const loud = require('../monitoring/loud');
+
+/**
+ * Canonical-JSON hash of a row object. HASH A in the three-stage design.
+ * Sort keys for stability so identical rows hash identically regardless of
+ * key insertion order. Uses the verbatim values — no trim, no normalize.
+ */
+function canonicalRowHash(row) {
+  const sorted = {};
+  for (const k of Object.keys(row).sort()) sorted[k] = row[k];
+  return crypto.createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+}
 
 /**
  * QuoteFixer — stream transform that rewrites RFC-non-compliant CSV
@@ -119,13 +131,23 @@ function validateHeaders(actual, expected) {
  * Map a raw CSV row into an object keyed by HubSpot property names,
  * using the supplied field list. Any field in the list whose CSV column
  * isn't in the row gets null. Fields in the row that aren't in the list
- * are dropped.
+ * are dropped (but the source row is preserved verbatim in raw_csv JSONB
+ * on the staging row, per memory financial_data_rules.md).
+ *
+ * Trim happens on the COPY produced here, never on the source row passed in.
  */
 function mapRowToHubspotProps(row, fieldList) {
   const out = {};
   for (const { csv, prop } of fieldList) {
     const v = row[csv];
-    out[prop] = (v === undefined || v === null || v === '') ? null : v;
+    if (v === undefined || v === null) {
+      out[prop] = null;
+    } else if (typeof v === 'string') {
+      const trimmed = v.trim();
+      out[prop] = trimmed === '' ? null : trimmed;
+    } else {
+      out[prop] = v === '' ? null : v;
+    }
   }
   return out;
 }
@@ -179,14 +201,11 @@ async function parseAndStage(filePath, source) {
     parser.on('data', (rawRow) => {
       rowCount++;
 
-      // Trim string values in place.
-      for (const k of Object.keys(rawRow)) {
-        if (typeof rawRow[k] === 'string') rawRow[k] = rawRow[k].trim();
-      }
-
-      // row_hash computed over the ORIGINAL raw CSV values (sorted for stability).
-      const rowHashInput = Object.keys(rawRow).sort().map(k => `${k}=${rawRow[k] ?? ''}`).join('|');
-      const rowHash = crypto.createHash('sha256').update(rowHashInput).digest('hex');
+      // HASH A: hash the verbatim raw CSV row before any modification.
+      // This is the immutable source-of-truth hash; HASH B re-computes the
+      // same digest from raw_csv after INSERT to prove DB persistence is
+      // lossless. Per memory financial_data_rules.md.
+      const rowHash = canonicalRowHash(rawRow);
 
       if (source === 'cif') {
         const cls = classifyCifRow(rawRow);
@@ -198,6 +217,7 @@ async function parseAndStage(filePath, source) {
         const fields = cls === 'contact' ? CIF_CONTACT_FIELDS : CIF_COMPANY_FIELDS;
         const mapped = mapRowToHubspotProps(rawRow, fields);
         mapped.row_hash = rowHash;
+        mapped.raw_csv = rawRow; // preserved verbatim, JSONB on the staging row
         (buckets[targetTable] ||= []).push(mapped);
         return;
       }
@@ -208,6 +228,7 @@ async function parseAndStage(filePath, source) {
         mapped.composite_key = generateCompositeKeyFromRaw(rawRow);
       }
       mapped.row_hash = rowHash;
+      mapped.raw_csv = rawRow;
       (buckets[config.staging] ||= []).push(mapped);
     });
 
@@ -248,7 +269,12 @@ async function insertRows(stagingTable, rows) {
         const off = ri * columns.length;
         return `(${columns.map((_, ci) => `$${off + ci + 1}`).join(', ')})`;
       }).join(', ');
-      const values = chunk.flatMap(r => columns.map(c => r[c] ?? null));
+      // raw_csv is JSONB — pg accepts a JS object only if we stringify it.
+      const values = chunk.flatMap(r => columns.map(c => {
+        const v = r[c];
+        if (c === 'raw_csv') return v == null ? null : JSON.stringify(v);
+        return v == null ? null : v;
+      }));
       await client.query(
         `INSERT INTO ${stagingTable} (${columns.join(', ')}) VALUES ${placeholders}`,
         values
@@ -265,10 +291,60 @@ async function insertRows(stagingTable, rows) {
   }
 }
 
+/**
+ * HASH B verification: re-read raw_csv from the staging table for every
+ * un-verified row and recompute the canonical row hash. Compare to the
+ * stored row_hash (HASH A from parse time). Equal → write db_persist_hash;
+ * unequal → flag needs_review and emit a loud alarm with the diagnosis.
+ *
+ * Returns { total, ok, mismatch } counts for the run.
+ */
+async function verifyDbPersistence(stagingTable, runId = null) {
+  const result = await pool.query(
+    `SELECT id, row_hash, raw_csv FROM ${stagingTable} WHERE db_persist_hash IS NULL`
+  );
+  let ok = 0, mismatch = 0;
+  for (const r of result.rows) {
+    if (!r.raw_csv) {
+      // Pre-existing row without raw_csv (legacy data from a prior version).
+      // Mark verified so it doesn't keep showing up; nothing to compare.
+      await pool.query(
+        `UPDATE ${stagingTable} SET db_persist_hash = $1, db_verified_at = NOW() WHERE id = $2`,
+        [r.row_hash, r.id]
+      );
+      continue;
+    }
+    const recomputed = canonicalRowHash(r.raw_csv);
+    if (recomputed === r.row_hash) {
+      await pool.query(
+        `UPDATE ${stagingTable} SET db_persist_hash = $1, db_verified_at = NOW() WHERE id = $2`,
+        [recomputed, r.id]
+      );
+      ok++;
+    } else {
+      await pool.query(
+        `UPDATE ${stagingTable} SET db_persist_hash = $1, db_verified_at = NOW(), needs_review = true WHERE id = $2`,
+        [recomputed, r.id]
+      );
+      await loud.alarm({
+        event: 'db_persist_mismatch',
+        message: `HASH A != HASH B on ${stagingTable} id=${r.id}: csv_hash=${r.row_hash} db_hash=${recomputed}`,
+        runId,
+        sourceTable: stagingTable,
+        context: { csv_hash: r.row_hash, db_hash: recomputed },
+      });
+      mismatch++;
+    }
+  }
+  return { total: result.rows.length, ok, mismatch };
+}
+
 module.exports = {
   parseAndStage,
   hashFile,
   generateRowHash,
   validateHeaders,
   expectedHeadersFor,
+  verifyDbPersistence,
+  canonicalRowHash,
 };

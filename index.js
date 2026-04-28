@@ -12,24 +12,27 @@ const { testAuth, uploadFile } = require('./src/sync/sftp-client');
 const { eventStream, installConsoleHook } = require('./src/monitoring/event-stream');
 const { TABLES, CIF_CONTACT_FIELDS, CIF_COMPANY_FIELDS } = require('./src/transform/hubspot-mapping');
 const { describeError } = require('./src/monitoring/errors');
+const loud = require('./src/monitoring/loud');
 
 // Forward all console output to SSE subscribers so the UI log panel sees it.
 installConsoleHook();
 
 // Surface async crashes that would otherwise be invisible to the UI log stream.
-// console.error is hooked above, so these land in /api/stream too.
+// Routes through loud.alarm so they're persisted to sync_errors and visible
+// in /api/issues (per memory financial_data_rules.md — every failure loud).
 process.on('unhandledRejection', (reason) => {
-  const msg = describeError(reason);
-  console.error(`╔ UNHANDLED PROMISE REJECTION ════════════════════════════════════╗`);
-  console.error(`║ ${msg}`);
-  if (reason && reason.stack) console.error(reason.stack);
-  console.error(`╚═════════════════════════════════════════════════════════════════╝`);
+  loud.alarm({
+    event: 'unhandled_rejection',
+    message: describeError(reason),
+    context: { stack: reason && reason.stack ? String(reason.stack).split('\n').slice(0, 5).join('\n') : null },
+  }).catch(() => {});
 });
 process.on('uncaughtException', (err) => {
-  console.error(`╔ UNCAUGHT EXCEPTION ═════════════════════════════════════════════╗`);
-  console.error(`║ ${describeError(err)}`);
-  if (err && err.stack) console.error(err.stack);
-  console.error(`╚═════════════════════════════════════════════════════════════════╝`);
+  loud.alarm({
+    event: 'uncaught_exception',
+    message: describeError(err),
+    context: { stack: err && err.stack ? String(err.stack).split('\n').slice(0, 5).join('\n') : null },
+  }).catch(() => {});
 });
 
 const app = express();
@@ -347,17 +350,97 @@ app.get('/api/schema-check', async (req, res) => {
 
 // -------------------- Nightly cron --------------------
 cron.schedule('0 2 * * *', async () => {
-  if (syncRunning) { console.log('Cron: sync already running, skipping'); return; }
+  if (syncRunning) {
+    await loud.warn({ event: 'cron_skip', message: 'Nightly cron found a sync already in progress; skipped this tick' });
+    return;
+  }
   console.log('Cron: starting nightly sync');
   syncRunning = true;
   try {
     await runFullSync(INCOMING_DIR, ARCHIVE_DIR, QUARANTINE_DIR);
   } catch (err) {
-    console.error('Cron sync failed:', err);
+    await loud.alarm({
+      event: 'cron_failed',
+      message: `Nightly cron sync threw: ${describeError(err)}`,
+      context: { stack: err && err.stack ? String(err.stack).split('\n').slice(0, 5).join('\n') : null },
+    });
   } finally {
     syncRunning = false;
   }
 }, { timezone: 'America/New_York' });
+
+// -------------------- Issues feed (UI Data Issues panel) --------------------
+app.get('/api/issues', async (req, res) => {
+  try {
+    const mappingIssues = await pool.query(
+      `SELECT id, source_csv, source_column, hs_object, hs_property, hs_type, problem,
+              sample_value, rows_affected, first_seen, last_seen
+       FROM mapping_issues ORDER BY last_seen DESC`
+    );
+
+    // Aggregate sync_errors across the most-recent 24h (a single nightly run
+    // may produce multiple run_ids — one per staging table — so MAX(run_id)
+    // alone misses most of them). 24h is wide enough to catch yesterday's
+    // run if you check in the morning.
+    const lastRun = await pool.query(`SELECT MAX(id) AS id FROM sync_log`);
+    const runId = lastRun.rows[0]?.id || null;
+
+    const bySeverity = await pool.query(
+      `SELECT severity, COUNT(*)::int AS c FROM sync_errors
+       WHERE created_at > NOW() - INTERVAL '24 hours'
+       GROUP BY severity`
+    );
+    const byType = await pool.query(
+      `SELECT error_type, COUNT(*)::int AS c FROM sync_errors
+       WHERE created_at > NOW() - INTERVAL '24 hours'
+       GROUP BY error_type ORDER BY c DESC`
+    );
+    const samples = await pool.query(
+      `SELECT id, run_id, source_table, source_key, error_type, severity, error_message, created_at
+       FROM sync_errors ORDER BY created_at DESC LIMIT 50`
+    );
+
+    // Hash health across all staging tables (cumulative across runs).
+    const stagingTables = ['stg_contacts','stg_companies','stg_deposits','stg_loans','stg_time_deposits','stg_debit_cards'];
+    const hashHealth = { csv_to_db: { ok: 0, mismatch: 0, pending: 0 }, db_to_hubspot: { ok: 0, mismatch: 0, pending: 0 } };
+    for (const t of stagingTables) {
+      try {
+        const r = await pool.query(`
+          SELECT
+            COUNT(*) FILTER (WHERE db_persist_hash IS NOT NULL AND needs_review IS NOT TRUE)::int AS ab_ok,
+            COUNT(*) FILTER (WHERE db_persist_hash IS NOT NULL AND needs_review IS TRUE)::int AS ab_mismatch,
+            COUNT(*) FILTER (WHERE db_persist_hash IS NULL)::int AS ab_pending,
+            COUNT(*) FILTER (WHERE hubspot_persist_hash IS NOT NULL AND hubspot_verify_diff IS NULL)::int AS bc_ok,
+            COUNT(*) FILTER (WHERE hubspot_persist_hash IS NOT NULL AND hubspot_verify_diff IS NOT NULL)::int AS bc_mismatch,
+            COUNT(*) FILTER (WHERE hubspot_persist_hash IS NULL)::int AS bc_pending
+          FROM ${t}
+        `);
+        const row = r.rows[0];
+        hashHealth.csv_to_db.ok += row.ab_ok;
+        hashHealth.csv_to_db.mismatch += row.ab_mismatch;
+        hashHealth.csv_to_db.pending += row.ab_pending;
+        hashHealth.db_to_hubspot.ok += row.bc_ok;
+        hashHealth.db_to_hubspot.mismatch += row.bc_mismatch;
+        hashHealth.db_to_hubspot.pending += row.bc_pending;
+      } catch { /* table may not exist yet */ }
+    }
+
+    res.json({
+      mapping_issues: mappingIssues.rows,
+      recent_run: {
+        run_id: runId,
+        by_severity: Object.fromEntries(bySeverity.rows.map(r => [r.severity, r.c])),
+        by_type:     Object.fromEntries(byType.rows.map(r => [r.error_type, r.c])),
+        samples:     samples.rows,
+      },
+      hash_health: hashHealth,
+    });
+  } catch (e) {
+    const msg = describeError(e);
+    console.error('issues query failed:', msg);
+    res.status(500).json({ error: msg });
+  }
+});
 
 // Start SFTP server if configured
 startSftpServer({
@@ -367,10 +450,38 @@ startSftpServer({
   },
 });
 
-// Start Express first, then init DB.
+// Seed mapping_issues from any field flagged `send: false` in the mapping
+// module. One row per held mapping so the UI's Data Issues panel always
+// reflects current state, even before any /sync runs.
+async function seedMappingIssues() {
+  const allFields = [
+    { csv: 'HubSpot_CIF.csv', hsObject: 'contacts',    fields: CIF_CONTACT_FIELDS },
+    { csv: 'HubSpot_CIF.csv', hsObject: 'companies',   fields: CIF_COMPANY_FIELDS },
+    { csv: 'HubSpot_DDA.csv', hsObject: '2-60442978',  fields: TABLES.dda.fields },
+    { csv: 'HubSpot_Loan.csv', hsObject: '2-60442977', fields: TABLES.loans.fields },
+    { csv: 'HubSpot_CD.csv', hsObject: '2-60442980',   fields: TABLES.cd.fields },
+    { csv: 'HubSpot_Debit_Card.csv', hsObject: '2-60442979', fields: TABLES.debit_cards.fields },
+  ];
+  for (const grp of allFields) {
+    for (const f of grp.fields) {
+      if (f.send !== false) continue;
+      await loud.mappingIssue({
+        sourceCsv: grp.csv, sourceColumn: f.csv,
+        hsObject: grp.hsObject, hsProperty: f.prop, hsType: f.type,
+        problem: f.holdReason || 'Mapping held — middleware will not transmit',
+      });
+    }
+  }
+}
+
+// Start Express first, then init DB and seed issues.
 app.listen(port, () => {
   console.log(`civista-integration listening on port ${port}`);
   initDb()
-    .then(() => console.log('Database initialized'))
-    .catch((err) => console.error('Database init failed (will retry on next request):', describeError(err)));
+    .then(() => {
+      console.log('Database initialized');
+      return seedMappingIssues();
+    })
+    .then(() => console.log('Mapping issues seeded'))
+    .catch((err) => console.error('Boot tasks failed (will retry on next request):', describeError(err)));
 });

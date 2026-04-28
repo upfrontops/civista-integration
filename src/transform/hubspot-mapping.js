@@ -44,7 +44,14 @@ const CIF_COMMON = [
   { csv: 'EnrollmentDt',        prop: 'enrollment_date',                         type: 'date' },
   { csv: 'CentralGroupID',      prop: 'central_group_id',                        type: 'string' },
   { csv: 'TextOptIn',           prop: 'text_opt_in',                             type: 'bool' },
-  { csv: 'DiscAcpt',            prop: 'estatement_disclosure_acceptance_date',   type: 'date' },
+  // DiscAcpt is a Y/N flag in the source CSV (audited across all 261k rows
+  // — 122k Y/N, 1 stray datetime, 1 free text). HubSpot's only matching
+  // property is `estatement_disclosure_acceptance_date` of type=date — there
+  // is no Y/N analogue. Per user direction, HOLD: preserve in staging
+  // (raw_csv keeps the original value), do not send to HubSpot, surface in
+  // the Data Issues UI panel via mapping_issues.
+  { csv: 'DiscAcpt',            prop: 'estatement_disclosure_acceptance_date',   type: 'date',
+    send: false, holdReason: 'Source CSV is Y/N flag; HubSpot property is date — irreconcilable without schema change' },
 ];
 
 // Contact-only properties (don't exist on HubSpot companies).

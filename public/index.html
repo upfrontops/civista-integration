@@ -87,6 +87,26 @@
 
   .spinner { display:inline-block; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; width:12px; height:12px; animation:spin 0.8s linear infinite; vertical-align:-1px; margin-right:6px; }
   @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* Data Issues panel — sticky red banner so a failure is impossible to miss. */
+  .issues-wrap { padding:0 20px 0 20px; }
+  .issues-card { background:#1f0f10; border:1px solid #6e2528; border-left:4px solid var(--err); border-radius:var(--radius); padding:12px 14px; margin-bottom:10px; }
+  .issues-card.clean { background:#0f1f14; border-color:#1f4f2a; border-left-color:#3fb950; }
+  .issues-card h3 { margin:0 0 8px 0; font-size:14px; color:var(--err); }
+  .issues-card.clean h3 { color:#3fb950; }
+  .issues-list { margin:0; padding:0; list-style:none; font-family:var(--font-mono); font-size:12px; }
+  .issues-list li { padding:4px 0; border-bottom:1px dashed var(--border); }
+  .issues-list li:last-child { border-bottom:none; }
+  .issues-list .src { color:var(--warn); }
+  .issues-list .arrow { color:var(--dim); margin:0 6px; }
+  .issues-list .target { color:var(--fg); }
+  .issues-list .meta { color:var(--dim); }
+
+  .hash-pills { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .hash-pill { padding:6px 10px; border-radius:99px; background:#1f0f10; border:1px solid #6e2528; color:var(--err); font-family:var(--font-mono); font-size:11px; }
+  .hash-pill.ok { background:#0f1f14; border-color:#1f4f2a; color:#3fb950; }
+  .hash-pill.pending { background:#1f1f14; border-color:#4e441f; color:var(--warn); }
+  .hash-pill b { font-weight:600; }
 </style>
 </head>
 <body>
@@ -147,6 +167,11 @@
     </div>
   </div>
 
+  <h2>⚠ Data Issues <span style="color:var(--dim); font-weight:400; margin-left:8px; font-size:12px;" id="issues-status">loading...</span></h2>
+  <div class="issues-wrap" id="issues-wrap">
+    <p style="color:var(--dim); font-size:12px; padding:0 20px;">Loading…</p>
+  </div>
+
   <h2>Schema Check — HubSpot vs Postgres</h2>
   <div class="schema-wrap" id="schema-wrap">
     <p style="color:var(--dim); font-size:12px;">Loading from HubSpot API &amp; Postgres...</p>
@@ -184,6 +209,8 @@ const $filePicker = qs('#file-picker'), $fileList = qs('#file-list');
 const $log = qs('#log'), $logStatus = qs('#log-status');
 const $actionStatus = qs('#action-status');
 const $schemaWrap = qs('#schema-wrap');
+const $issuesWrap = qs('#issues-wrap');
+const $issuesStatus = qs('#issues-status');
 const $cbAutoscroll = qs('#cb-autoscroll');
 const $btnClearLog = qs('#btn-clear-log');
 
@@ -279,11 +306,18 @@ $btnSync.addEventListener('click', async () => {
     const res = await fetch('/sync', { method:'POST' });
     const body = await res.json();
     setStatus($actionStatus, res.ok ? '✓ Sync running — watch the log' : '✗ ' + (body.error || 'sync failed'), res.ok ? 'ok' : 'err');
+    // Sync runs async on the server. Refresh issues a few times so the user
+    // sees the data populate as records ship + the read-back verifies.
+    if (res.ok) {
+      setTimeout(loadIssues, 3000);
+      setTimeout(loadIssues, 10000);
+      setTimeout(loadIssues, 30000);
+    }
   } catch (e) {
     setStatus($actionStatus, '✗ ' + e.message, 'err');
   }
 });
-$btnSchemaRefresh.addEventListener('click', loadSchemaCheck);
+$btnSchemaRefresh.addEventListener('click', () => { loadSchemaCheck(); loadIssues(); });
 
 function addLogLine({ level, message, at }) {
   const row = el('div', { className: level || 'info' },
@@ -389,6 +423,116 @@ async function loadSchemaCheck() {
   }
 }
 loadSchemaCheck();
+
+// Data Issues panel — surfaces held mappings + recent run severities + hash health.
+// Polled every 15s and after any /sync completion. Per memory financial_data_rules.md
+// every loud failure surfaces here so the operator can show the client live.
+async function loadIssues() {
+  try {
+    const res = await fetch('/api/issues');
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || 'Failed to load issues');
+
+    clear($issuesWrap);
+
+    const totalIssues =
+      (body.mapping_issues?.length || 0) +
+      (body.recent_run?.by_severity?.error || 0) +
+      (body.hash_health?.csv_to_db?.mismatch || 0) +
+      (body.hash_health?.db_to_hubspot?.mismatch || 0);
+    $issuesStatus.textContent = totalIssues > 0
+      ? `${totalIssues} issue${totalIssues === 1 ? '' : 's'}`
+      : 'all clean';
+
+    // Hash health pills (always visible — green pills tell the operator the
+    // verification is alive).
+    const hh = body.hash_health || { csv_to_db:{}, db_to_hubspot:{} };
+    const pillsCard = el('div', { className: 'issues-card ' + (
+      (hh.csv_to_db.mismatch || hh.db_to_hubspot.mismatch) ? '' : 'clean'
+    ) });
+    pillsCard.appendChild(el('h3', {}, '🔐 Hash Health'));
+    const pills = el('div', { className: 'hash-pills' });
+    const mkPill = (label, info) => {
+      const cls = info.mismatch > 0 ? '' : info.pending > 0 ? 'pending' : 'ok';
+      return el('span', { className: 'hash-pill ' + cls },
+        label, '  ',
+        el('b', {}, '✓ ' + (info.ok || 0)), ' ok  ',
+        el('b', {}, '✘ ' + (info.mismatch || 0)), ' mismatch  ',
+        el('b', {}, (info.pending || 0) + ' pending'),
+      );
+    };
+    pills.appendChild(mkPill('A→B (CSV → DB)', hh.csv_to_db));
+    pills.appendChild(mkPill('B→C (DB → HubSpot)', hh.db_to_hubspot));
+    pillsCard.appendChild(pills);
+    $issuesWrap.appendChild(pillsCard);
+
+    // Held mappings (send: false in hubspot-mapping.js).
+    if (body.mapping_issues && body.mapping_issues.length > 0) {
+      const mc = el('div', { className: 'issues-card' });
+      mc.appendChild(el('h3', {}, '🛑 Held Mappings — not sent to HubSpot'));
+      const ul = el('ul', { className: 'issues-list' });
+      for (const m of body.mapping_issues) {
+        const li = el('li', {},
+          el('span', { className: 'src' }, m.source_csv + ' · ' + m.source_column),
+          el('span', { className: 'arrow' }, '→'),
+          el('span', { className: 'target' }, m.hs_object + '.' + m.hs_property + ' (' + m.hs_type + ')'),
+          el('div', { className: 'meta' },
+            m.problem,
+            m.sample_value ? ` · sample: "${m.sample_value}"` : '',
+            m.rows_affected ? ` · ${m.rows_affected} rows affected` : ''
+          )
+        );
+        ul.appendChild(li);
+      }
+      mc.appendChild(ul);
+      $issuesWrap.appendChild(mc);
+    }
+
+    // Recent-run errors/warnings summary.
+    const sev = body.recent_run?.by_severity || {};
+    const types = body.recent_run?.by_type || {};
+    if ((sev.error || 0) + (sev.warning || 0) > 0) {
+      const rc = el('div', { className: 'issues-card' });
+      rc.appendChild(el('h3', {},
+        '⚠ Most recent run',
+        body.recent_run?.run_id ? ` (run ${body.recent_run.run_id})` : ''
+      ));
+      const summary = el('div', { className: 'meta', style: 'margin-bottom:6px;' },
+        `errors: ${sev.error || 0}  ·  warnings: ${sev.warning || 0}  ·  info: ${sev.info || 0}`
+      );
+      rc.appendChild(summary);
+      const breakdown = el('div', { className: 'meta', style: 'margin-bottom:8px;' },
+        Object.entries(types).map(([k, v]) => `${k}=${v}`).join('  ·  ')
+      );
+      rc.appendChild(breakdown);
+      const ul = el('ul', { className: 'issues-list' });
+      for (const s of (body.recent_run?.samples || []).slice(0, 12)) {
+        const li = el('li', {},
+          el('span', { className: s.severity === 'error' ? 'src' : 'meta' },
+            (s.severity === 'error' ? '✘' : '⚠') + ' ' + s.error_type),
+          ' ',
+          el('span', { className: 'target' }, (s.source_table || '—') + (s.source_key ? ' · ' + s.source_key : '')),
+          el('div', { className: 'meta' }, s.error_message)
+        );
+        ul.appendChild(li);
+      }
+      rc.appendChild(ul);
+      $issuesWrap.appendChild(rc);
+    }
+
+    if (totalIssues === 0) {
+      const ok = el('div', { className: 'issues-card clean' });
+      ok.appendChild(el('h3', {}, '✓ All clear — no issues, all hashes verified'));
+      $issuesWrap.appendChild(ok);
+    }
+  } catch (e) {
+    clear($issuesWrap);
+    $issuesWrap.appendChild(el('p', { style:'color:var(--err); padding:0 20px;' }, 'Issues query failed: ' + e.message));
+    $issuesStatus.textContent = 'failed';
+  }
+}
+loadIssues();
+setInterval(loadIssues, 15000);
 </script>
 </body>
 </html>

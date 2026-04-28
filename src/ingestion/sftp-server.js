@@ -3,6 +3,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { Server } = require('ssh2');
+const loud = require('../monitoring/loud');
 
 /**
  * Resolve the SSH host key. Two options:
@@ -71,8 +72,14 @@ function startSftpServer(options = {}) {
       if (ctx.username === allowedUser && ctx.password === allowedPass) {
         ctx.accept();
       } else {
-        console.warn(`⚠  SFTP auth rejected: user=${ctx.username}`);
+        // Reject the auth synchronously, then loud.warn (don't await — keeps
+        // the SSH handshake responsive). loud.warn handles its own errors.
         ctx.reject(['password']);
+        loud.warn({
+          event: 'sftp_auth_rejected',
+          message: `SFTP auth rejected for user=${ctx.username}`,
+          context: { username: ctx.username, method: ctx.method },
+        }).catch(() => {});
       }
     });
 
@@ -97,7 +104,11 @@ function startSftpServer(options = {}) {
             // instead of returning OK on a stream that's actually broken.
             stream.on('error', (err) => {
               entry.writeError = err;
-              console.error(`✘ SFTP write stream error for ${path.basename(filePath)}: ${err.code || err.message}`);
+              loud.alarm({
+                event: 'sftp_write_error',
+                message: `SFTP write stream error on ${path.basename(filePath)}: ${err.code || err.message}`,
+                context: { path: filePath, code: err.code },
+              }).catch(() => {});
             });
             openFiles.set(handle.toString('hex'), entry);
             sftp.handle(reqid, handle);
@@ -139,7 +150,11 @@ function startSftpServer(options = {}) {
             if (file.writeError) {
               file.stream.destroy();
               openFiles.delete(key);
-              console.error(`✘ SFTP CLOSE on ${path.basename(file.path)} after prior error — not delivering`);
+              loud.alarm({
+                event: 'sftp_close_aborted',
+                message: `SFTP delivery aborted on ${path.basename(file.path)} due to prior write error`,
+                context: { path: file.path, code: file.writeError.code, reason: file.writeError.message },
+              }).catch(() => {});
               sftp.status(reqid, 4, `upload aborted: ${file.writeError.code || file.writeError.message}`);
               return;
             }
