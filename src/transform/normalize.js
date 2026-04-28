@@ -100,17 +100,13 @@ function coerceDateForHubSpot(val) {
   const m = trimmed.match(/^(\d{4}-\d{2}-\d{2})[T\s]\d{2}:\d{2}/);
   if (m) return { value: m[1] };
 
-  // Last resort: try Date parsing. If valid, take its UTC date portion.
-  // Otherwise it's unparseable garbage like "Y", "(NULL)", etc.
-  const d = new Date(trimmed);
-  if (!isNaN(d.getTime())) {
-    const y = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    return { value: `${y}-${mm}-${dd}` };
-  }
+  // No `new Date()` last-resort. JS Date is permissive and accepts ambiguous
+  // inputs like "1" → 2001-01-01 or "03/18/26" → varies by locale. For
+  // financial data we refuse to materialize a date out of garbage; surface
+  // the problem and let the operator decide. Raw value is still preserved
+  // verbatim in raw_csv on the staging row.
   const preview = trimmed.length > 40 ? trimmed.slice(0, 40) + '…' : trimmed;
-  return { value: null, problem: `unparseable date: "${preview}"` };
+  return { value: null, problem: `unparseable date (refusing JS Date fallback): "${preview}"` };
 }
 
 module.exports = {

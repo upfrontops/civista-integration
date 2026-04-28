@@ -298,13 +298,25 @@ async function syncRows(rows, fields, objectType, idProperty, opts = {}) {
 
   // HASH C — read back from HubSpot and verify the persisted properties
   // match the DB-side payload. Gated by VERIFY_HUBSPOT_READBACK env var.
+  // Records that fail HASH C must NOT enter shipped_records — otherwise the
+  // diff engine would skip them on future runs and they'd never be retried.
+  // We move them from succeeded → failed here.
+  let finalSucceeded = succeeded;
+  let finalFailed = failed;
   if (succeeded.length > 0 && sourceTable && process.env.VERIFY_HUBSPOT_READBACK !== '0') {
-    await verifyHubspotPersistence({
+    const { mismatchedKeys } = await verifyHubspotPersistence({
       objectType, idProperty, sourceTable, succeeded, dbPayloadByKey, runId,
     });
+    if (mismatchedKeys.size > 0) {
+      finalSucceeded = succeeded.filter(s => !mismatchedKeys.has(s.sourceKey));
+      const moved = succeeded
+        .filter(s => mismatchedKeys.has(s.sourceKey))
+        .map(s => ({ sourceKey: s.sourceKey, reason: 'HASH C mismatch — HubSpot value did not match DB payload (record present in HubSpot but flagged needs_review)' }));
+      finalFailed = failed.concat(moved);
+    }
   }
 
-  return { succeeded, failed, invalidInputs: invalid };
+  return { succeeded: finalSucceeded, failed: finalFailed, invalidInputs: invalid };
 }
 
 /**
@@ -321,6 +333,11 @@ async function verifyHubspotPersistence({ objectType, idProperty, sourceTable, s
   const propNames = new Set();
   for (const p of dbPayloadByKey.values()) for (const k of Object.keys(p)) propNames.add(k);
   const properties = Array.from(propNames);
+
+  // Track which sourceKeys failed verification — caller filters them out
+  // of `succeeded` so they don't enter shipped_records and get skipped on
+  // future runs (a known-corrupt row in HubSpot must be retried).
+  const mismatchedKeys = new Set();
 
   for (let i = 0; i < succeeded.length; i += BATCH_SIZE) {
     const chunk = succeeded.slice(i, i + BATCH_SIZE);
@@ -340,6 +357,8 @@ async function verifyHubspotPersistence({ objectType, idProperty, sourceTable, s
         runId, sourceTable,
         context: { batchSize: chunk.length },
       });
+      // Treat the whole chunk as unverifiable → mismatched (don't enter ledger).
+      for (const s of chunk) mismatchedKeys.add(s.sourceKey);
       continue;
     }
     if (!response.ok) {
@@ -349,13 +368,26 @@ async function verifyHubspotPersistence({ objectType, idProperty, sourceTable, s
         runId, sourceTable,
         context: { batchSize: chunk.length, status: response.status },
       });
+      for (const s of chunk) mismatchedKeys.add(s.sourceKey);
       continue;
     }
     const byId = new Map((response.body?.results || []).map(r => [r.id, r.properties || {}]));
 
     for (const s of chunk) {
-      const dbPayload = dbPayloadByKey.get(s.sourceKey);
-      if (!dbPayload) continue;
+      // canonicalize lookup key — both sides should be String, but be defensive
+      const lookupKey = s.sourceKey == null ? null : String(s.sourceKey);
+      const dbPayload = lookupKey == null ? null : dbPayloadByKey.get(lookupKey);
+      if (!dbPayload) {
+        // Should never happen — succeeded entry came from the batch we built.
+        // Loud-alarm so it can't be silent.
+        await loud.alarm({
+          event: 'hubspot_readback_no_payload',
+          message: `Cannot HASH C verify ${sourceTable} hubspot_id=${s.hubspotId}: no DB payload for sourceKey=${s.sourceKey}`,
+          runId, sourceTable, sourceKey: s.sourceKey,
+        });
+        mismatchedKeys.add(s.sourceKey);
+        continue;
+      }
       const hsProps = byId.get(s.hubspotId);
       if (!hsProps) {
         await pool.query(
@@ -367,6 +399,7 @@ async function verifyHubspotPersistence({ objectType, idProperty, sourceTable, s
           message: `Read-back returned no record for hubspot_id=${s.hubspotId} sourceKey=${s.sourceKey} on ${objectType}`,
           runId, sourceTable, sourceKey: s.sourceKey,
         });
+        mismatchedKeys.add(s.sourceKey);
         continue;
       }
 
@@ -382,10 +415,14 @@ async function verifyHubspotPersistence({ objectType, idProperty, sourceTable, s
       const hsHash = hashCanonical(hsProps, Object.keys(dbPayload));
 
       if (Object.keys(diff).length === 0) {
+        // HASH C matched. Write the hash + clear the prior diff. DO NOT
+        // touch needs_review — if HASH B set it (CSV→DB lost something),
+        // we must preserve that signal. Per memory financial_data_rules.md:
+        // a successful HASH C does not absolve a HASH B failure.
         await pool.query(
           `UPDATE ${sourceTable}
              SET hubspot_persist_hash = $1, hubspot_verified_at = NOW(),
-                 hubspot_verify_diff = NULL, needs_review = false
+                 hubspot_verify_diff = NULL
            WHERE ${idProperty} = $2`,
           [hsHash, s.sourceKey]
         );
@@ -403,9 +440,12 @@ async function verifyHubspotPersistence({ objectType, idProperty, sourceTable, s
           runId, sourceTable, sourceKey: s.sourceKey,
           context: { diff, hubspotId: s.hubspotId, dbHash, hsHash },
         });
+        mismatchedKeys.add(s.sourceKey);
       }
     }
   }
+
+  return { mismatchedKeys };
 }
 
 function canonicalScalar(v) {

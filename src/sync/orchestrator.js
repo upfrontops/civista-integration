@@ -132,14 +132,14 @@ async function syncFile(source, filePath) {
   console.log(`\n========== Processing ${path.basename(filePath)} (${sourceLabel}) ==========`);
 
   // Circuit breaker runs against the source-level row count (the CSV).
-  const { rowCount, fileHash, byTable, unclassified } = await parseAndStage(filePath, source);
+  const { rowCount, fileHash, byTable, unclassified, sinceTs } = await parseAndStage(filePath, source);
 
-  // HASH B verification: every staging table touched by this parse needs to
-  // re-read raw_csv and confirm the row hash round-trips. Loud alarm on any
-  // mismatch (loss between CSV and DB).
+  // HASH B verification: scope to rows inserted in THIS parse (loaded_at
+  // >= sinceTs) so overlapping /sync invocations don't race on each
+  // other's pending rows.
   for (const stagingTable of Object.keys(byTable)) {
-    const v = await verifyDbPersistence(stagingTable);
-    console.log(`HASH B verify ${stagingTable}: ${v.ok}/${v.total} ok, ${v.mismatch} mismatch`);
+    const v = await verifyDbPersistence(stagingTable, sinceTs);
+    console.log(`HASH B verify ${stagingTable}: ${v.ok}/${v.total} ok, ${v.mismatch} mismatch, ${v.legacy} legacy`);
   }
 
   const cbResult = await checkCircuitBreaker(source, rowCount);

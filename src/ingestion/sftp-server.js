@@ -99,11 +99,18 @@ function startSftpServer(options = {}) {
             const filePath = path.join(incomingDir, path.basename(filename));
             handle.writeUInt32BE(handleCount++);
             const stream = fs.createWriteStream(filePath);
-            const entry = { path: filePath, stream, writeError: null };
-            // Capture any disk error so we can fail the next WRITE/CLOSE loudly
-            // instead of returning OK on a stream that's actually broken.
+            // pendingCallbacks holds write callbacks awaiting the stream's
+            // 'drain' event when backpressure was triggered, so a stream
+            // error can fail every still-pending WRITE rather than letting
+            // some get OK'd while others are stuck.
+            const entry = { path: filePath, stream, writeError: null, pending: [] };
             stream.on('error', (err) => {
               entry.writeError = err;
+              // Fail every callback that hasn't been resolved yet.
+              const pend = entry.pending.splice(0);
+              for (const cb of pend) {
+                try { cb(err); } catch {}
+              }
               loud.alarm({
                 event: 'sftp_write_error',
                 message: `SFTP write stream error on ${path.basename(filePath)}: ${err.code || err.message}`,
@@ -124,10 +131,10 @@ function startSftpServer(options = {}) {
               sftp.status(reqid, 4, `disk write failed: ${file.writeError.code || file.writeError.message}`);
               return;
             }
-            // Wait for the write to actually be accepted before reporting OK.
-            // Without this, the client thinks the byte range succeeded while the
-            // stream may be buffering or about to error.
-            file.stream.write(data, (err) => {
+            // Track this write so a later stream-level error can fail it.
+            const cb = (err) => {
+              const ix = file.pending.indexOf(cb);
+              if (ix >= 0) file.pending.splice(ix, 1);
               if (err) {
                 file.writeError = err;
                 console.error(`✘ SFTP WRITE failed on ${path.basename(file.path)}: ${err.code || err.message}`);
@@ -135,7 +142,15 @@ function startSftpServer(options = {}) {
               } else {
                 sftp.status(reqid, 0); // OK
               }
-            });
+            };
+            file.pending.push(cb);
+            // write() returns false when internal buffer is full → backpressure.
+            // ssh2 doesn't pipeline aggressively but we still respect it: when
+            // backpressure hits, callbacks accumulate until 'drain'.
+            const ok = file.stream.write(data, cb);
+            if (!ok) {
+              file.stream.once('drain', () => { /* callbacks fire as writes flush */ });
+            }
           });
 
           sftp.on('CLOSE', (reqid, handle) => {

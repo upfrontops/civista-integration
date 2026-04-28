@@ -17,9 +17,14 @@ const loud = require('./src/monitoring/loud');
 // Forward all console output to SSE subscribers so the UI log panel sees it.
 installConsoleHook();
 
-// Surface async crashes that would otherwise be invisible to the UI log stream.
-// Routes through loud.alarm so they're persisted to sync_errors and visible
-// in /api/issues (per memory financial_data_rules.md — every failure loud).
+// Surface async crashes that would otherwise be invisible to the UI log
+// stream. Routes through loud.alarm so they're persisted and shown in
+// /api/issues (per memory financial_data_rules.md — every failure loud).
+//
+// On uncaughtException we MUST terminate — Node's default behavior is to
+// exit, and an event handler keeps the process alive in a corrupted state
+// (open DB transactions, leaked clients, half-applied changes). For a
+// financial pipeline that's the worst of both worlds. Log loud, then exit.
 process.on('unhandledRejection', (reason) => {
   loud.alarm({
     event: 'unhandled_rejection',
@@ -32,7 +37,13 @@ process.on('uncaughtException', (err) => {
     event: 'uncaught_exception',
     message: describeError(err),
     context: { stack: err && err.stack ? String(err.stack).split('\n').slice(0, 5).join('\n') : null },
-  }).catch(() => {});
+  })
+    .catch(() => {})
+    .finally(() => {
+      // Give the loud.alarm INSERT 500ms to flush, then bail. Do NOT keep
+      // running on a corrupted heap — the supervisor (Railway) will restart.
+      setTimeout(() => process.exit(1), 500);
+    });
 });
 
 const app = express();

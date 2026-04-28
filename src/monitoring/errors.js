@@ -14,10 +14,15 @@ const ERROR_TYPES = {
   INFRA: 'infra',
 };
 
-async function recordError({ runId, sourceTable, sourceKey, errorType, errorMessage, recordSnapshot }) {
+async function recordError({ runId, sourceTable, sourceKey, errorType, errorMessage, recordSnapshot, severity }) {
+  // severity defaults to 'error' (matches the column default). Accepting it
+  // explicitly avoids the previous race where loud.js INSERTed then UPDATEd
+  // by (error_type, error_message) — concurrent identical events tagged the
+  // wrong rows.
+  const sev = severity || 'error';
   await pool.query(
-    `INSERT INTO sync_errors (run_id, source_table, source_key, error_type, error_message, record_snapshot)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+    `INSERT INTO sync_errors (run_id, source_table, source_key, error_type, error_message, record_snapshot, severity)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [
       runId || null,
       sourceTable || null,
@@ -25,6 +30,7 @@ async function recordError({ runId, sourceTable, sourceKey, errorType, errorMess
       errorType,
       errorMessage,
       recordSnapshot ? JSON.stringify(recordSnapshot) : null,
+      sev,
     ]
   );
 }

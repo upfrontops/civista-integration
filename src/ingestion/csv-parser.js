@@ -15,11 +15,41 @@ const loud = require('../monitoring/loud');
  * Canonical-JSON hash of a row object. HASH A in the three-stage design.
  * Sort keys for stability so identical rows hash identically regardless of
  * key insertion order. Uses the verbatim values — no trim, no normalize.
+ *
+ * Two normalization rules MATTER for HASH A == HASH B to round-trip
+ * cleanly through Postgres JSONB:
+ *   - undefined / null / '' all collapse to '' before hashing. csv-parse
+ *     emits '' for empty cells; JSON.stringify drops `undefined` keys
+ *     entirely; JSONB returns the stored representation. Without this,
+ *     "missing column" rows hash differently before vs. after INSERT.
+ *   - Strip the UTF-8 BOM from the FIRST key only. Silver Lake / Jack
+ *     Henry exports occasionally start the file with `﻿`, which
+ *     csv-parse pulls into the first header. JSONB stores the BOM
+ *     verbatim, so it round-trips, but downstream column lookups would
+ *     mismatch. Strip once at the top.
  */
 function canonicalRowHash(row) {
   const sorted = {};
-  for (const k of Object.keys(row).sort()) sorted[k] = row[k];
+  for (const k of Object.keys(row).sort()) {
+    const v = row[k];
+    sorted[k] = (v === null || v === undefined) ? '' : v;
+  }
   return crypto.createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+}
+
+/**
+ * Strip a leading UTF-8 BOM from any keys that have one. csv-parse pulls
+ * the BOM into the first header on Windows-saved files. We do this on a
+ * COPY so the verbatim row passed to canonicalRowHash above is preserved
+ * (the JSONB raw_csv keeps the BOM if it was there) — only the dictionary
+ * we use for column lookup is normalized.
+ */
+function stripBomKeys(row) {
+  const out = {};
+  for (const k of Object.keys(row)) {
+    out[k.replace(/^﻿/, '')] = row[k];
+  }
+  return out;
 }
 
 /**
@@ -167,6 +197,11 @@ async function parseAndStage(filePath, source) {
   const expected = expectedHeadersFor(source);
   const fileHash = await hashFile(filePath);
 
+  // Capture the start timestamp BEFORE any INSERTs so verifyDbPersistence
+  // can scope its SELECT to "rows from this parse" and not race with
+  // overlapping /sync invocations.
+  const sinceTs = new Date().toISOString();
+
   // Buckets to collect rows per target staging table.
   const buckets = {};
   const unclassified = [];  // raw rows that classifyCifRow returns 'unclassified' for
@@ -207,15 +242,19 @@ async function parseAndStage(filePath, source) {
       // lossless. Per memory financial_data_rules.md.
       const rowHash = canonicalRowHash(rawRow);
 
+      // BOM-stripped view used ONLY for column lookup. The verbatim rawRow
+      // (BOM included if present) goes into raw_csv unchanged.
+      const lookupRow = stripBomKeys(rawRow);
+
       if (source === 'cif') {
-        const cls = classifyCifRow(rawRow);
+        const cls = classifyCifRow(lookupRow);
         if (cls === 'unclassified') {
           unclassified.push(rawRow);
           return;
         }
         const targetTable = cls === 'contact' ? 'stg_contacts' : 'stg_companies';
         const fields = cls === 'contact' ? CIF_CONTACT_FIELDS : CIF_COMPANY_FIELDS;
-        const mapped = mapRowToHubspotProps(rawRow, fields);
+        const mapped = mapRowToHubspotProps(lookupRow, fields);
         mapped.row_hash = rowHash;
         mapped.raw_csv = rawRow; // preserved verbatim, JSONB on the staging row
         (buckets[targetTable] ||= []).push(mapped);
@@ -223,9 +262,9 @@ async function parseAndStage(filePath, source) {
       }
 
       const config = TABLES[source];
-      const mapped = mapRowToHubspotProps(rawRow, config.fields);
+      const mapped = mapRowToHubspotProps(lookupRow, config.fields);
       if (source === 'debit_cards') {
-        mapped.composite_key = generateCompositeKeyFromRaw(rawRow);
+        mapped.composite_key = generateCompositeKeyFromRaw(lookupRow);
       }
       mapped.row_hash = rowHash;
       mapped.raw_csv = rawRow;
@@ -242,7 +281,7 @@ async function parseAndStage(filePath, source) {
         if (quoteFixer.fixCount > 0) {
           console.warn(`⚠  QuoteFixer repaired ${quoteFixer.fixCount} embedded quotes in ${filePath}`);
         }
-        resolve({ rowCount, fileHash, byTable, unclassified, parseSkipped, quotesFixed: quoteFixer.fixCount });
+        resolve({ rowCount, fileHash, byTable, unclassified, parseSkipped, quotesFixed: quoteFixer.fixCount, sinceTs });
       } catch (err) { reject(err); }
     });
 
@@ -292,26 +331,44 @@ async function insertRows(stagingTable, rows) {
 }
 
 /**
- * HASH B verification: re-read raw_csv from the staging table for every
- * un-verified row and recompute the canonical row hash. Compare to the
- * stored row_hash (HASH A from parse time). Equal → write db_persist_hash;
- * unequal → flag needs_review and emit a loud alarm with the diagnosis.
+ * HASH B verification: re-read raw_csv from the staging table for rows
+ * inserted in this parse run, recompute the canonical row hash, and
+ * compare to the stored row_hash (HASH A from parse time). Equal →
+ * write db_persist_hash; unequal → flag needs_review + loud alarm.
  *
- * Returns { total, ok, mismatch } counts for the run.
+ * Scoped by `loaded_at >= sinceTs` (the timestamp at the start of this
+ * parse) so concurrent /sync invocations don't double-verify each
+ * other's pending rows. Without this, two overlapping syncs would race
+ * on UPDATE and double-count.
+ *
+ * Returns { total, ok, mismatch, legacy } counts for the run.
  */
-async function verifyDbPersistence(stagingTable, runId = null) {
+async function verifyDbPersistence(stagingTable, sinceTs, runId = null) {
+  const params = [sinceTs];
   const result = await pool.query(
-    `SELECT id, row_hash, raw_csv FROM ${stagingTable} WHERE db_persist_hash IS NULL`
+    `SELECT id, row_hash, raw_csv FROM ${stagingTable}
+     WHERE db_persist_hash IS NULL AND loaded_at >= $1`,
+    params
   );
-  let ok = 0, mismatch = 0;
+  let ok = 0, mismatch = 0, legacy = 0;
   for (const r of result.rows) {
     if (!r.raw_csv) {
-      // Pre-existing row without raw_csv (legacy data from a prior version).
-      // Mark verified so it doesn't keep showing up; nothing to compare.
+      // Pre-existing row without raw_csv (legacy data from a prior version
+      // OR a parse that pre-dates the lossless-preservation refactor). We
+      // CANNOT verify A==B for these — surface that loudly so the operator
+      // knows the success counter doesn't apply.
       await pool.query(
-        `UPDATE ${stagingTable} SET db_persist_hash = $1, db_verified_at = NOW() WHERE id = $2`,
+        `UPDATE ${stagingTable}
+           SET db_persist_hash = $1, db_verified_at = NOW(), needs_review = true
+         WHERE id = $2`,
         [r.row_hash, r.id]
       );
+      await loud.warn({
+        event: 'db_persist_unverifiable',
+        message: `${stagingTable} id=${r.id} has no raw_csv — HASH B cannot be verified; row flagged needs_review`,
+        runId, sourceTable: stagingTable,
+      });
+      legacy++;
       continue;
     }
     const recomputed = canonicalRowHash(r.raw_csv);
@@ -336,7 +393,7 @@ async function verifyDbPersistence(stagingTable, runId = null) {
       mismatch++;
     }
   }
-  return { total: result.rows.length, ok, mismatch };
+  return { total: result.rows.length, ok, mismatch, legacy };
 }
 
 module.exports = {
