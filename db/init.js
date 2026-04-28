@@ -1,7 +1,15 @@
 const { Pool } = require('pg');
 
+// Pool timeouts: a hung Postgres can lock up /health forever. Railway's
+// healthcheck has a strict timeout — pool.connect() must fail fast when
+// the DB is unreachable so we can return 503 instead of timing out.
+// Ref: Railway message of 2026-04-28 about /health hanging.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  connectionTimeoutMillis: 2000,
+  idleTimeoutMillis: 30000,
+  // Cap any single statement at 5s so a wedged query doesn't tie up the pool.
+  statement_timeout: 5000,
 });
 
 /**
@@ -282,8 +290,24 @@ async function initDb() {
       await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS hubspot_verified_at TIMESTAMPTZ`);
       await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS hubspot_verify_diff JSONB`);
       await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS needs_review BOOLEAN DEFAULT false`);
+      // Coercion audit per memory rule 3 — every transformation recorded.
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS coercions JSONB DEFAULT '[]'::jsonb`);
       await client.query(`CREATE INDEX IF NOT EXISTS idx_${t}_needs_review ON ${t}(needs_review) WHERE needs_review = true`);
     }
+
+    // Meta table for sandbox<->prod portal cutover safeguard. Stores the
+    // last HubSpot portal id we ran against so the boot check can refuse
+    // to start when HUBSPOT_API_KEY flips between sandbox and prod
+    // (sandbox-portal hubspot_ids in shipped_records would be invalid in
+    // prod). Cutover script (scripts/cutover-portal.js) clears the
+    // affected tables and updates this row.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
 
     // Persistent record of CSV->HubSpot mapping mismatches so the UI can
     // display them across runs. Populated at startup (one row per send:false

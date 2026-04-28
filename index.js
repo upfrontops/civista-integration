@@ -53,6 +53,15 @@ const INCOMING_DIR = process.env.INCOMING_DIR || path.join(__dirname, 'incoming'
 const ARCHIVE_DIR = process.env.ARCHIVE_DIR || path.join(__dirname, 'archive');
 const QUARANTINE_DIR = process.env.QUARANTINE_DIR || path.join(__dirname, 'quarantine');
 
+// Feature flags (Railway env vars). Defaults are conservative for prod:
+// the debug UI, wire log, and schema-check route are OFF unless explicitly
+// enabled. Manual /sync requires a token; without one set, /sync returns 403
+// and only the cron can trigger a sync.
+const ENABLE_DEBUG_UI    = process.env.ENABLE_DEBUG_UI === '1';
+const ENABLE_WIRE_LOG    = process.env.ENABLE_WIRE_LOG === '1';
+const ENABLE_SCHEMA_CHECK = process.env.ENABLE_SCHEMA_CHECK === '1';
+const MANUAL_SYNC_TOKEN  = process.env.MANUAL_SYNC_TOKEN || null;
+
 fs.mkdirSync(INCOMING_DIR, { recursive: true });
 fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
@@ -65,38 +74,83 @@ fs.mkdirSync(TMP_UPLOAD_DIR, { recursive: true });
 const upload = multer({ dest: TMP_UPLOAD_DIR });
 
 app.use(express.json());
-// Static assets for the debug UI
-app.use(express.static(path.join(__dirname, 'public')));
 
-// Service info (was the root handler; keep under /api/info).
+// Static assets for the debug UI — only when ENABLE_DEBUG_UI=1.
+// When the flag is off, GET / and any /index.html etc. return 404 so the
+// service is API-only in prod by default.
+if (ENABLE_DEBUG_UI) {
+  app.use(express.static(path.join(__dirname, 'public')));
+} else {
+  app.get('/', (req, res) => res.status(404).send('Debug UI disabled (set ENABLE_DEBUG_UI=1)'));
+}
+
+// Service info — public, no auth, no flag.
 app.get('/api/info', (req, res) => {
   res.json({
     service: 'civista-integration',
     version: '1.0.0',
     description: 'Civista Bank HubSpot nightly data sync pipeline',
+    features: {
+      debug_ui: ENABLE_DEBUG_UI,
+      wire_log: ENABLE_WIRE_LOG,
+      schema_check: ENABLE_SCHEMA_CHECK,
+      manual_sync: !!MANUAL_SYNC_TOKEN,
+    },
   });
 });
 
 app.get('/health', async (req, res) => {
+  // Race the DB-backed health query against a 2s timeout. If we go past
+  // that, return 503 — Railway's healthcheck will mark the service
+  // unhealthy and restart it (per Q14: fail healthcheck if DB down).
+  // Without this, pool.connect() can hang indefinitely when Postgres is
+  // unreachable (Railway-reported bug).
+  const timeoutMs = 2000;
+  let timed = false;
+  const timer = new Promise((resolve) => setTimeout(() => { timed = true; resolve({ status: 'unhealthy', database: 'unreachable', error: `health check timed out after ${timeoutMs}ms` }); }, timeoutMs));
   try {
-    const status = await getHealthStatus();
-    res.status(200).json(status);
+    const status = await Promise.race([getHealthStatus(), timer]);
+    if (status && status.database === 'connected') return res.status(200).json(status);
+    return res.status(503).json(status || { status: 'unhealthy', database: 'unknown' });
   } catch (err) {
-    res.status(200).json({ status: 'starting', database: 'connecting', error: describeError(err) });
+    return res.status(503).json({ status: 'unhealthy', database: 'unreachable', error: describeError(err) });
   }
 });
 
 // -------------------- Sync --------------------
 let syncRunning = false;
+let portalGuardOk = false; // set true by checkPortalCutover() at boot
 
+// Manual sync route. Requires header `X-Sync-Token: <value>` matching the
+// MANUAL_SYNC_TOKEN env var. Without that env set, the route is disabled
+// and only the 2 AM cron triggers a sync. Per Q11 (cron + auth-gated /sync).
 app.post('/sync', async (req, res) => {
+  if (!MANUAL_SYNC_TOKEN) {
+    return res.status(403).json({ error: 'Manual /sync disabled. Set MANUAL_SYNC_TOKEN env var to enable.' });
+  }
+  const provided = req.get('X-Sync-Token');
+  if (provided !== MANUAL_SYNC_TOKEN) {
+    await loud.warn({
+      event: 'manual_sync_auth_rejected',
+      message: 'POST /sync attempted without a valid X-Sync-Token',
+      context: { hasHeader: !!provided },
+    });
+    return res.status(403).json({ error: 'X-Sync-Token missing or invalid' });
+  }
+  if (!portalGuardOk) {
+    return res.status(503).json({ error: 'Portal cutover guard failed; sync disabled. See logs / run scripts/cutover-portal.js.' });
+  }
   if (syncRunning) return res.status(409).json({ error: 'Sync already in progress' });
   syncRunning = true;
   res.json({ message: 'Sync started', startedAt: new Date().toISOString() });
   try {
     await runFullSync(INCOMING_DIR, ARCHIVE_DIR, QUARANTINE_DIR);
   } catch (err) {
-    console.error('Sync failed:', err);
+    await loud.alarm({
+      event: 'manual_sync_failed',
+      message: `Manual sync threw: ${describeError(err)}`,
+      context: { stack: err && err.stack ? String(err.stack).split('\n').slice(0, 5).join('\n') : null },
+    });
   } finally {
     syncRunning = false;
   }
@@ -112,7 +166,21 @@ app.post('/api/sftp-auth', async (req, res) => {
     await testAuth({ host, port, username, password });
     res.json({ ok: true });
   } catch (e) {
-    console.warn(`SFTP auth failed from UI: ${e.message}`);
+    // Diagnostic on failure: log enough to identify autofill / whitespace
+    // issues without leaking the password. Compare received vs expected
+    // length and first/last char codes.
+    const expected = process.env.SFTP_PASS || '';
+    const recv = String(password);
+    const summary = {
+      length_recv: recv.length,
+      length_expected: expected.length,
+      first_char_code: recv.charCodeAt(0) || null,
+      last_char_code: recv.charCodeAt(recv.length - 1) || null,
+      has_leading_ws: /^\s/.test(recv),
+      has_trailing_ws: /\s$/.test(recv),
+      username_recv: username,
+    };
+    console.warn(`SFTP auth failed from UI: ${e.message} · diagnostic=${JSON.stringify(summary)}`);
     res.status(401).json({ error: e.message });
   }
 });
@@ -189,8 +257,8 @@ app.get('/api/stream', (req, res) => {
     }
   };
   send({ level: 'info', message: 'SSE log stream connected', at: new Date().toISOString() });
-  // HubSpot wire-log feed — separate SSE event name so the UI renders it
-  // in its own panel ("deterministic API calls for HubSpot as I use this UI").
+  // HubSpot wire-log feed — separate SSE event name. Only attached when
+  // ENABLE_WIRE_LOG=1 because emitHubspot also no-ops when disabled.
   const sendHubspot = (record) => {
     if (detached) return;
     try {
@@ -200,10 +268,10 @@ app.get('/api/stream', (req, res) => {
     }
   };
   eventStream.on('log', send);
-  eventStream.on('hubspot', sendHubspot);
+  if (ENABLE_WIRE_LOG) eventStream.on('hubspot', sendHubspot);
   const fullDetach = () => {
     detach();
-    eventStream.off('hubspot', sendHubspot);
+    if (ENABLE_WIRE_LOG) eventStream.off('hubspot', sendHubspot);
   };
   req.on('close', fullDetach);
   res.on('error', fullDetach);
@@ -236,6 +304,12 @@ async function countCsvRows(filePath) {
 }
 
 app.get('/api/schema-check', async (req, res) => {
+  // Gated by ENABLE_SCHEMA_CHECK so prod doesn't accidentally hammer
+  // HubSpot 12 calls per /api/schema-check load. Also stays on-click only
+  // in the UI per Q12.
+  if (!ENABLE_SCHEMA_CHECK) {
+    return res.status(404).json({ error: 'Schema check disabled (set ENABLE_SCHEMA_CHECK=1)' });
+  }
   try {
     const apiKey = process.env.HUBSPOT_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'HUBSPOT_API_KEY not set' });
@@ -393,6 +467,13 @@ app.get('/api/schema-check', async (req, res) => {
 
 // -------------------- Nightly cron --------------------
 cron.schedule('0 2 * * *', async () => {
+  if (!portalGuardOk) {
+    await loud.alarm({
+      event: 'cron_skip_portal_guard',
+      message: 'Nightly cron skipped: portal cutover guard has not passed since boot. Run scripts/cutover-portal.js or restart the service.',
+    });
+    return;
+  }
   if (syncRunning) {
     await loud.warn({ event: 'cron_skip', message: 'Nightly cron found a sync already in progress; skipped this tick' });
     return;
@@ -485,6 +566,46 @@ app.get('/api/issues', async (req, res) => {
   }
 });
 
+// Coercion audit — every transformation recorded on the staging row.
+// Per Q5 / memory rule 3: every coercion is auditable. This endpoint
+// aggregates the `coercions` JSONB across all 6 staging tables so the UI
+// can show "what was transformed and why" before the operator approves
+// the data going to HubSpot.
+app.get('/api/coercions', async (req, res) => {
+  const STAGING = ['stg_contacts','stg_companies','stg_deposits','stg_loans','stg_time_deposits','stg_debit_cards'];
+  try {
+    const byCoerce = {};
+    const samples = []; // up to 25 sample rows showing actual from/to pairs
+    for (const t of STAGING) {
+      let r;
+      try {
+        r = await pool.query(`
+          SELECT id, ${t === 'stg_debit_cards' ? 'composite_key AS source_key' : (t === 'stg_contacts' || t === 'stg_companies' ? 'cif_number AS source_key' : 'primary_key AS source_key')}, coercions
+          FROM ${t}
+          WHERE coercions IS NOT NULL AND jsonb_array_length(coercions) > 0
+          ORDER BY id DESC
+          LIMIT 1000
+        `);
+      } catch (e) { continue; }
+      for (const row of r.rows) {
+        const arr = row.coercions || [];
+        for (const c of arr) {
+          const k = c.coerce || 'unknown';
+          if (!byCoerce[k]) byCoerce[k] = { count: 0, props: {} };
+          byCoerce[k].count++;
+          byCoerce[k].props[c.prop] = (byCoerce[k].props[c.prop] || 0) + 1;
+          if (samples.length < 25) {
+            samples.push({ table: t, source_key: row.source_key, ...c });
+          }
+        }
+      }
+    }
+    res.json({ by_coerce: byCoerce, samples });
+  } catch (e) {
+    res.status(500).json({ error: describeError(e) });
+  }
+});
+
 // Start SFTP server if configured
 startSftpServer({
   incomingDir: INCOMING_DIR,
@@ -493,38 +614,88 @@ startSftpServer({
   },
 });
 
-// Seed mapping_issues from any field flagged `send: false` in the mapping
-// module. One row per held mapping so the UI's Data Issues panel always
-// reflects current state, even before any /sync runs.
-async function seedMappingIssues() {
-  const allFields = [
-    { csv: 'HubSpot_CIF.csv', hsObject: 'contacts',    fields: CIF_CONTACT_FIELDS },
-    { csv: 'HubSpot_CIF.csv', hsObject: 'companies',   fields: CIF_COMPANY_FIELDS },
-    { csv: 'HubSpot_DDA.csv', hsObject: '2-60442978',  fields: TABLES.dda.fields },
-    { csv: 'HubSpot_Loan.csv', hsObject: '2-60442977', fields: TABLES.loans.fields },
-    { csv: 'HubSpot_CD.csv', hsObject: '2-60442980',   fields: TABLES.cd.fields },
-    { csv: 'HubSpot_Debit_Card.csv', hsObject: '2-60442979', fields: TABLES.debit_cards.fields },
-  ];
-  for (const grp of allFields) {
-    for (const f of grp.fields) {
-      if (f.send !== false) continue;
-      await loud.mappingIssue({
-        sourceCsv: grp.csv, sourceColumn: f.csv,
-        hsObject: grp.hsObject, hsProperty: f.prop, hsType: f.type,
-        problem: f.holdReason || 'Mapping held — middleware will not transmit',
-      });
-    }
+// Sandbox→prod portal cutover guard. On boot, fetch the current HubSpot
+// portal id and compare to what's stored in `meta`. If different (or
+// first ever), refuse to proceed until the operator runs
+// `scripts/cutover-portal.js` to TRUNCATE staging+ledger and update meta.
+//
+// Per memory rule 6: sandbox is Civista's child portal linked to the
+// live account; switching keys without clearing the sandbox-portal
+// hubspot_ids in shipped_records would silently corrupt prod sync.
+async function checkPortalCutover() {
+  const apiKey = process.env.HUBSPOT_API_KEY;
+  if (!apiKey) {
+    await loud.alarm({
+      event: 'hubspot_key_missing',
+      message: 'HUBSPOT_API_KEY env var is unset; refusing to proceed.',
+    });
+    return false;
   }
+  let currentPortalId = null;
+  try {
+    const r = await fetch('https://api.hubapi.com/account-info/v3/details', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      await loud.alarm({
+        event: 'hubspot_account_info_failed',
+        message: `HubSpot account-info HTTP ${r.status}: ${body.message || 'no body'}`,
+      });
+      return false;
+    }
+    currentPortalId = String(body.portalId || body.hubId || '');
+  } catch (e) {
+    await loud.alarm({
+      event: 'hubspot_account_info_failed',
+      message: `HubSpot account-info fetch failed: ${describeError(e)}`,
+    });
+    return false;
+  }
+  if (!currentPortalId) {
+    await loud.alarm({
+      event: 'hubspot_account_info_empty',
+      message: 'HubSpot returned no portal id; cannot enforce cutover guard.',
+    });
+    return false;
+  }
+  const stored = await pool.query(`SELECT value FROM meta WHERE key = 'last_portal_id'`);
+  const storedPortalId = stored.rows[0]?.value || null;
+  if (storedPortalId === null) {
+    // First ever boot against a portal — record it.
+    await pool.query(
+      `INSERT INTO meta (key, value, updated_at) VALUES ('last_portal_id', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [currentPortalId]
+    );
+    console.log(`Portal cutover guard: registered first-ever portal id = ${currentPortalId}`);
+    return true;
+  }
+  if (storedPortalId !== currentPortalId) {
+    await loud.alarm({
+      event: 'portal_cutover_required',
+      message: `HUBSPOT_API_KEY portal (${currentPortalId}) differs from last-known portal (${storedPortalId}). REFUSING to start. Run scripts/cutover-portal.js to TRUNCATE staging+ledger and acknowledge the cutover.`,
+      context: { stored: storedPortalId, current: currentPortalId },
+    });
+    return false;
+  }
+  console.log(`Portal cutover guard: portal ${currentPortalId} unchanged ✓`);
+  return true;
 }
 
-// Start Express first, then init DB and seed issues.
+// Start Express first, then init DB and run the portal cutover guard.
 app.listen(port, () => {
   console.log(`civista-integration listening on port ${port}`);
   initDb()
     .then(() => {
       console.log('Database initialized');
-      return seedMappingIssues();
+      return checkPortalCutover();
     })
-    .then(() => console.log('Mapping issues seeded'))
+    .then((ok) => {
+      portalGuardOk = ok;
+      if (!ok) {
+        console.error('Portal cutover guard FAILED — service will refuse /sync until resolved.');
+      }
+    })
     .catch((err) => console.error('Boot tasks failed (will retry on next request):', describeError(err)));
 });

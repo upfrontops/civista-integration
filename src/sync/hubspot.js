@@ -102,26 +102,6 @@ async function hubspotFetch(path, options = {}) {
 }
 
 /**
- * Coerce a raw staging-table value (always TEXT) into the type HubSpot expects.
- * Returns null for empty/missing values so they don't get sent as empty strings.
- *
- * Date type uses coerceDateForHubSpot which can return a `problem` if the
- * source value isn't a parseable date. The caller is responsible for
- * surfacing that problem via loud.warn — buildPayload does so below.
- */
-function coerceByType(value, type) {
-  if (value === null || value === undefined || value === '') return { value: null };
-  switch (type) {
-    case 'number':      return { value: normalizeNumber(String(value)) };
-    case 'bool':        return { value: normalizeBoolean(String(value)) };
-    case 'date':        return coerceDateForHubSpot(value);
-    case 'enumeration': return { value: String(value) };
-    case 'string':
-    default:            return { value: String(value) };
-  }
-}
-
-/**
  * Special-case the Deceased flag — source uses a literal space character
  * for "alive," which normalizeBoolean would treat as false (correct) but
  * we keep the dedicated function to preserve the original CLAUDE.md rule.
@@ -131,38 +111,94 @@ function coerceDeceased(value) {
 }
 
 /**
- * Build a HubSpot-ready payload from a staging row using the mapping's
- * type hints. Drops nulls, internal columns, and any field flagged
- * `send: false` in the mapping (held mappings — preserved in staging,
- * not transmitted; surfaced to UI via mapping_issues).
+ * Build a HubSpot-ready payload from a staging row using the mapping.
  *
- * Returns { props, dateProblems } where dateProblems is an array of
- * { csv, prop, raw, problem } entries the caller can route through loud.warn.
+ * Per memory financial_data_rules.md (Rule 3): coercion is opt-in per
+ * property via the `coerce` field. Default = no coercion = trim and send
+ * the raw value. If the value doesn't match HubSpot's expected type,
+ * HubSpot will reject the record and we surface the rejection loudly.
+ *
+ * Returns { props, coercions, suspectKeys } where:
+ *   props        — what gets sent to HubSpot
+ *   coercions    — audit array: [{ prop, csv, from, to, coerce }]
+ *                  written to staging row's `coercions` JSONB column
+ *   suspectKeys  — set of prop names where coerce_email flagged a bad value;
+ *                  caller uses this to isolate the row into a 1-row batch
+ *   problems     — non-coerce-related per-row problems (date_only could not
+ *                  parse, etc.) for loud surfacing
  */
 function buildPayload(row, fields) {
   const props = {};
-  const coercionProblems = []; // both date and email mismatches surface here
+  const coercions = [];
+  const suspectKeys = new Set();
+  const problems = [];
+
   for (const f of fields) {
-    if (f.send === false) continue; // held mapping
     const { csv, prop, type } = f;
     const raw = row[prop];
-    let coerced;
+
+    // Empty / null → omit from payload entirely (HubSpot treats absent props as no-change).
+    if (raw === null || raw === undefined || raw === '') continue;
+
+    // Special non-opt-in coercions retained from the source-data CLAUDE.md edge cases.
     if (prop === 'deceased_flag_yn') {
-      coerced = { value: coerceDeceased(raw) };
-    } else if (prop === 'email') {
-      coerced = coerceEmailForHubSpot(raw);
-    } else {
-      coerced = coerceByType(raw, type);
+      const v = coerceDeceased(raw);
+      props[prop] = v;
+      // Always audit because we transformed the value.
+      coercions.push({ prop, csv, from: raw, to: v, coerce: 'deceased_flag_special' });
+      continue;
     }
-    if (coerced.problem) {
-      coercionProblems.push({ csv, prop, raw, problem: coerced.problem });
-      continue; // omit unparseable value — preserved verbatim in raw_csv
+
+    // Opt-in coercions per the mapping's `coerce` flag.
+    if (f.coerce === 'yn_to_bool') {
+      const v = normalizeBoolean(String(raw));
+      props[prop] = v;
+      coercions.push({ prop, csv, from: raw, to: v, coerce: 'yn_to_bool' });
+      continue;
     }
-    if (coerced.value !== null && coerced.value !== undefined) {
-      props[prop] = coerced.value;
+    if (f.coerce === 'date_only') {
+      const r = coerceDateForHubSpot(raw);
+      if (r.problem) {
+        problems.push({ csv, prop, raw, problem: r.problem });
+        continue; // unparseable → omit; raw still in raw_csv
+      }
+      if (r.value !== null && r.value !== undefined && r.value !== raw) {
+        coercions.push({ prop, csv, from: raw, to: r.value, coerce: 'date_only' });
+      }
+      props[prop] = r.value;
+      continue;
     }
+    if (f.coerce === 'email_strict') {
+      const r = coerceEmailForHubSpot(raw);
+      if (r.problem) {
+        // Suspect — caller will isolate the row in a 1-row batch so the
+        // failure doesn't poison 99 valid records.
+        suspectKeys.add(prop);
+        problems.push({ csv, prop, raw, problem: r.problem });
+        // Still attempt to send the raw value so HubSpot's own rejection is the
+        // authoritative signal. The 1-row batch isolation ensures only this row
+        // dies if HubSpot also rejects.
+        props[prop] = String(raw).trim();
+        continue;
+      }
+      if (r.value !== raw) {
+        coercions.push({ prop, csv, from: raw, to: r.value, coerce: 'email_strict' });
+      }
+      props[prop] = r.value;
+      continue;
+    }
+
+    // No coerce opt-in → trim string, leave numbers/bools/etc as their string form.
+    // HubSpot will validate and reject if needed; rejections surface loudly.
+    const trimmed = typeof raw === 'string' ? raw.trim() : String(raw);
+    if (trimmed === '') continue;
+    if (trimmed !== raw) {
+      coercions.push({ prop, csv, from: raw, to: trimmed, coerce: 'trim' });
+    }
+    props[prop] = trimmed;
   }
-  return { props, dateProblems: coercionProblems };
+
+  return { props, coercions, suspectKeys, problems };
 }
 
 /**
@@ -192,12 +228,12 @@ function validateBatchInputs(inputs, idProperty) {
  * treated as failed — we never silently assume success.
  */
 async function batchUpsert(objectType, idProperty, inputs, opts = {}) {
-  const { runId = null, sourceTable = null } = opts;
+  const { runId = null, sourceTable = null, batchSize = BATCH_SIZE } = opts;
   const succeeded = [];
   const failed = [];
 
-  for (let i = 0; i < inputs.length; i += BATCH_SIZE) {
-    const batch = inputs.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < inputs.length; i += batchSize) {
+    const batch = inputs.slice(i, i + batchSize);
     const sentKeys = new Set(batch.map(b => b.properties?.[idProperty]).filter(Boolean));
 
     let response;
@@ -271,44 +307,67 @@ async function syncRows(rows, fields, objectType, idProperty, opts = {}) {
 
   const dbPayloadByKey = new Map();
   const inputs = [];
+  const suspectInputKeys = new Set();
 
   for (const row of rows) {
-    const { props, dateProblems } = buildPayload(row, fields);
+    const { props, coercions, suspectKeys, problems } = buildPayload(row, fields);
 
-    // Surface every coercion problem (date OR email — the property is omitted
-    // from the HubSpot payload, but the raw value is still in raw_csv).
-    // Loud + persisted so the operator sees it before HubSpot would have
-    // rejected the whole batch.
-    for (const dp of dateProblems) {
-      const event = dp.prop === 'email' ? 'email_coercion_skipped' : 'date_coercion_skipped';
+    // Persist the coercion audit onto the staging row's `coercions` JSONB
+    // column. Required by memory rule 3: every transformation must be
+    // explained on the row, not just inferred from logs.
+    if (sourceTable && coercions.length > 0) {
+      try {
+        await pool.query(
+          `UPDATE ${sourceTable} SET coercions = $1 WHERE ${idProperty} = $2`,
+          [JSON.stringify(coercions), row[idProperty]]
+        );
+      } catch (e) {
+        await loud.alarm({
+          event: 'coercion_audit_write_failed',
+          message: `Could not persist coercion audit on ${sourceTable} ${idProperty}=${row[idProperty]}: ${e.message}`,
+          runId, sourceTable, sourceKey: row[idProperty] || null,
+        });
+      }
+    }
+
+    // Loud-surface coercion problems (couldn't parse a date that was opt-in,
+    // suspect email, etc). The property is omitted (or sent raw); raw value
+    // stays in raw_csv. The operator sees this before HubSpot rejects.
+    for (const p of problems) {
+      const event =
+        p.prop === 'email' ? 'email_suspect' :
+        p.problem.startsWith('unparseable date') ? 'date_unparseable' :
+        'coercion_problem';
       await loud.warn({
         event,
-        message: `${sourceCsv || sourceTable}.${dp.csv} → ${dp.prop}: ${dp.problem}`,
+        message: `${sourceCsv || sourceTable}.${p.csv} → ${p.prop}: ${p.problem}`,
         runId, sourceTable, sourceKey: row[idProperty] || null,
-        context: { rawValue: dp.raw, prop: dp.prop, csv: dp.csv },
+        context: { rawValue: p.raw, prop: p.prop, csv: p.csv },
       });
     }
 
-    // Always include the idProperty value in properties — HubSpot's batch
-    // upsert needs to see it under that name. This fixes the debit-cards
-    // composite_key bug (composite_key isn't in DEBIT_CARDS_FIELDS so
-    // buildPayload never copies it).
+    // Always include the idProperty value in properties (fixes the
+    // composite_key bug for debit cards; harmless for the rest).
     if (row[idProperty] !== undefined && row[idProperty] !== null && props[idProperty] === undefined) {
       props[idProperty] = String(row[idProperty]);
     }
 
     // Custom objects require `name` (verified via HubSpot schema API:
-    // requiredProperties=['name'], primaryDisplayProperty='name'). Source
-    // CSVs have no name column, so per user direction we set it to the
-    // unique key (primary_key for DDA/Loans/CD, composite_key for Debit
-    // Cards). Contacts/companies don't get this — HubSpot derives display
-    // names from firstname/lastname and from CIF FullName→name.
+    // requiredProperties=['name'], primaryDisplayProperty='name'). Use the
+    // unique key as the display label.
     if (CUSTOM_OBJECTS_REQUIRING_NAME.has(objectType) && !props.name && row[idProperty]) {
       props.name = String(row[idProperty]);
     }
 
     const sk = props[idProperty];
-    if (sk) dbPayloadByKey.set(sk, props);
+    if (sk) {
+      dbPayloadByKey.set(sk, props);
+      // Mark this row as suspect IF buildPayload flagged any suspect
+      // properties (currently only email_strict). Suspect rows get isolated
+      // into 1-row batches downstream so a HubSpot rejection doesn't kill
+      // the other 99 records in the batch.
+      if (suspectKeys.size > 0) suspectInputKeys.add(sk);
+    }
 
     inputs.push({ idProperty, id: row[idProperty], properties: props });
   }
@@ -325,9 +384,26 @@ async function syncRows(rows, fields, objectType, idProperty, opts = {}) {
     });
   }
 
-  const { succeeded, failed } = valid.length > 0
-    ? await batchUpsert(objectType, idProperty, valid, { runId, sourceTable })
-    : { succeeded: [], failed: [] };
+  // Split into clean (default 100/batch) and suspect (forced 1/batch).
+  // Suspect rows are isolated so a per-record rejection (e.g., HubSpot
+  // refusing an invalid email) only fails THAT row, never poisoning the
+  // 99 other valid records that share its batch. Per Q7 / memory rule 5.
+  const cleanInputs = valid.filter(v => !suspectInputKeys.has(v.properties?.[idProperty]));
+  const suspectInputs = valid.filter(v => suspectInputKeys.has(v.properties?.[idProperty]));
+
+  let succeeded = [];
+  let failed = [];
+  if (cleanInputs.length > 0) {
+    const r = await batchUpsert(objectType, idProperty, cleanInputs, { runId, sourceTable, batchSize: BATCH_SIZE });
+    succeeded = succeeded.concat(r.succeeded);
+    failed = failed.concat(r.failed);
+  }
+  if (suspectInputs.length > 0) {
+    console.log(`Isolating ${suspectInputs.length} suspect row(s) into 1-record batches for ${objectType}`);
+    const r = await batchUpsert(objectType, idProperty, suspectInputs, { runId, sourceTable, batchSize: 1 });
+    succeeded = succeeded.concat(r.succeeded);
+    failed = failed.concat(r.failed);
+  }
 
   // HASH C — read back from HubSpot and verify the persisted properties
   // match the DB-side payload. Gated by VERIFY_HUBSPOT_READBACK env var.

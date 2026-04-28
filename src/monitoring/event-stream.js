@@ -42,10 +42,15 @@ function installConsoleHook() {
 /**
  * Emit a HubSpot wire-log event. Subscribers (the UI) get a structured
  * record of every API call we make so they can demonstrate to the client
- * exactly what data is moving and where. This is in addition to the
- * generic 'log' event — the wire feed is its own channel.
+ * exactly what data is moving. This is in addition to the generic 'log'
+ * event — the wire feed is its own channel.
+ *
+ * Gated by `ENABLE_WIRE_LOG=1`. On a 700k-row sync that's ~14k events; we
+ * default OFF in prod so we don't pay the per-record fanout overhead
+ * unless someone has explicitly opted in.
  */
 function emitHubspot(record) {
+  if (process.env.ENABLE_WIRE_LOG !== '1') return;
   eventStream.emit('hubspot', {
     at: new Date().toISOString(),
     ...record,

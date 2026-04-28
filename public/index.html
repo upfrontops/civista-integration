@@ -191,6 +191,11 @@
     <div style="color:var(--dim); font-size:11px;">No HubSpot calls yet. Try the Schema-Check or Run Full Sync buttons.</div>
   </div>
 
+  <h2>🧾 Coercion Audit <span style="color:var(--dim); font-weight:400; margin-left:8px; font-size:12px;" id="coerce-status">loading...</span></h2>
+  <div class="issues-wrap" id="coerce-wrap">
+    <p style="color:var(--dim); font-size:12px; padding:0 20px;">Loading…</p>
+  </div>
+
   <h2>⚠ Data Issues <span style="color:var(--dim); font-weight:400; margin-left:8px; font-size:12px;" id="issues-status">loading...</span></h2>
   <div class="issues-wrap" id="issues-wrap">
     <p style="color:var(--dim); font-size:12px; padding:0 20px;">Loading…</p>
@@ -235,6 +240,8 @@ const $actionStatus = qs('#action-status');
 const $schemaWrap = qs('#schema-wrap');
 const $issuesWrap = qs('#issues-wrap');
 const $issuesStatus = qs('#issues-status');
+const $coerceWrap = qs('#coerce-wrap');
+const $coerceStatus = qs('#coerce-status');
 const $wireWrap = qs('#wire-wrap');
 const $wireStatus = qs('#wire-status');
 const $btnClearWire = qs('#btn-clear-wire');
@@ -484,7 +491,10 @@ async function loadSchemaCheck() {
     $schemaWrap.appendChild(el('p', { style:'color:var(--err)' }, e.message));
   }
 }
-loadSchemaCheck();
+// Schema Check is on-click only (Q12). Don't auto-load on UI open. The
+// "Refresh Schema Check" button triggers loadSchemaCheck() when needed.
+//
+// loadSchemaCheck();  // intentionally not called
 
 // Data Issues panel — surfaces held mappings + recent run severities + hash health.
 // Polled every 15s and after any /sync completion. Per memory financial_data_rules.md
@@ -595,6 +605,67 @@ async function loadIssues() {
 }
 loadIssues();
 setInterval(loadIssues, 15000);
+
+// Coercion Audit panel — every transformation that ran during the most
+// recent sync, grouped by coerce type (date_only / email_strict /
+// yn_to_bool / trim / deceased_flag_special). Per memory rule 3: every
+// derived value must be auditable.
+async function loadCoercions() {
+  try {
+    const res = await fetch('/api/coercions');
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || 'Failed to load coercions');
+    clear($coerceWrap);
+
+    const byCoerce = body.by_coerce || {};
+    const types = Object.keys(byCoerce);
+    if (types.length === 0) {
+      const ok = el('div', { className: 'issues-card clean' });
+      ok.appendChild(el('h3', {}, '✓ No coercions in current staging'));
+      ok.appendChild(el('div', { className: 'meta' }, 'Either no rows have been parsed yet, or every value passed through unchanged.'));
+      $coerceWrap.appendChild(ok);
+      $coerceStatus.textContent = '0 transformations';
+      return;
+    }
+
+    const total = types.reduce((s, k) => s + byCoerce[k].count, 0);
+    $coerceStatus.textContent = `${total} transformations across ${types.length} coerce types`;
+
+    for (const type of types) {
+      const info = byCoerce[type];
+      const card = el('div', { className: 'issues-card' });
+      card.appendChild(el('h3', {}, `${type} · ${info.count} row${info.count === 1 ? '' : 's'}`));
+      const propEntries = Object.entries(info.props).sort((a, b) => b[1] - a[1]);
+      const list = el('ul', { className: 'issues-list' });
+      for (const [prop, count] of propEntries) {
+        list.appendChild(el('li', {},
+          el('span', { className: 'target' }, prop),
+          el('span', { className: 'meta', style: 'margin-left:8px;' }, `${count} row${count === 1 ? '' : 's'}`)
+        ));
+      }
+      card.appendChild(list);
+
+      // Show a couple of from/to samples so the operator can show the
+      // client exactly what changed.
+      const matches = (body.samples || []).filter(s => s.coerce === type).slice(0, 3);
+      if (matches.length) {
+        card.appendChild(el('div', { className: 'meta', style: 'margin-top:6px; font-weight:600;' }, 'Sample transformations:'));
+        for (const s of matches) {
+          card.appendChild(el('div', { className: 'meta', style: 'font-family: var(--font-mono);' },
+            `${s.prop}: "${String(s.from).slice(0, 40)}" → "${String(s.to).slice(0, 40)}"  (${s.table} · ${s.source_key})`
+          ));
+        }
+      }
+      $coerceWrap.appendChild(card);
+    }
+  } catch (e) {
+    clear($coerceWrap);
+    $coerceWrap.appendChild(el('p', { style: 'color:var(--err); padding:0 20px;' }, 'Coercion query failed: ' + e.message));
+    $coerceStatus.textContent = 'failed';
+  }
+}
+loadCoercions();
+setInterval(loadCoercions, 15000);
 </script>
 </body>
 </html>

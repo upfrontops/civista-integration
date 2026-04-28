@@ -9,3 +9,4 @@ validate.sh
 # PII — never commit banking data
 *.csv
 *.vtt
+scripts/__pycache__/

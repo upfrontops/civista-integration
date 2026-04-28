@@ -7,10 +7,20 @@
  * Structure for each entry:
  *   csv:      CSV header name as it appears in the file
  *   prop:     HubSpot property name (snake_case, matches schema exactly)
- *   type:     HubSpot property type — drives coercion at send time
+ *   type:     HubSpot property type
  *             'string' | 'number' | 'bool' | 'date' | 'enumeration'
+ *   coerce:   (optional) explicitly authorize a transformation at send time.
+ *             'date_only'    → strip time portion; raw datetime preserved in raw_csv
+ *             'email_strict' → validate RFC-ish; suspect rows isolated in 1-row batches
+ *             undefined      → DEFAULT. No coercion. Send the trimmed raw value as-is.
+ *                              If HubSpot rejects, the rejection surfaces per record loudly.
  *
- * Fields with no HubSpot target are intentionally omitted (dropped at parse).
+ * Per memory financial_data_rules.md (Rule 3): coercions require explicit opt-in.
+ * Default behavior is to send raw and let HubSpot reject mismatches. Every coercion
+ * is recorded as an audit row in the staging row's `coercions` JSONB column.
+ *
+ * Fields with no HubSpot target are intentionally omitted (dropped at parse,
+ * but preserved verbatim in raw_csv on the staging row).
  */
 
 // CIF CSV → Contact or Company, depending on classification.
@@ -18,57 +28,59 @@
 // and schemas/companies.json.
 const CIF_COMMON = [
   { csv: 'CIFNum',              prop: 'cif_number',                              type: 'string' },
-  { csv: 'Email',               prop: 'email',                                   type: 'string' },
+  { csv: 'Email',               prop: 'email',                                   type: 'string', coerce: 'email_strict' },
   { csv: 'PhoneNumber',         prop: 'phone',                                   type: 'string' },
   { csv: 'Address1',            prop: 'address',                                 type: 'string' },
   { csv: 'City',                prop: 'city',                                    type: 'string' },
   { csv: 'State',               prop: 'state',                                   type: 'string' },
   { csv: 'ZipCode',             prop: 'zip',                                     type: 'string' },
   { csv: 'HashSSN',             prop: 'hashed_ssn',                              type: 'string' },
-  { csv: 'DoNotCall',           prop: 'dnc_flag_yn',                             type: 'bool' },
+  { csv: 'DoNotCall',           prop: 'dnc_flag_yn',                             type: 'bool', coerce: 'yn_to_bool' },
   { csv: 'InsiderCode',         prop: 'insider_code',                            type: 'string' },
-  { csv: 'InsufficientAddress', prop: 'insufficient_address_yn',                 type: 'bool' },
-  { csv: 'CLFFlag',             prop: 'clf_flag_yn',                             type: 'bool' },
-  { csv: 'CivAtWork',           prop: 'civistawork_yn',                          type: 'bool' },
-  { csv: 'OrigCustDate',        prop: 'orginal_customer_date',                   type: 'date' },   // HubSpot typo preserved
+  { csv: 'InsufficientAddress', prop: 'insufficient_address_yn',                 type: 'bool', coerce: 'yn_to_bool' },
+  { csv: 'CLFFlag',             prop: 'clf_flag_yn',                             type: 'bool', coerce: 'yn_to_bool' },
+  { csv: 'CivAtWork',           prop: 'civistawork_yn',                          type: 'bool', coerce: 'yn_to_bool' },
+  { csv: 'OrigCustDate',        prop: 'orginal_customer_date',                   type: 'date', coerce: 'date_only' },   // HubSpot typo preserved
+  // Deceased: source convention uses ' ' (space) for alive, 'Y' for deceased.
+  // Special-cased in buildPayload (NOT yn_to_bool) because " "/"N"/empty all → false.
   { csv: 'Deceased',            prop: 'deceased_flag_yn',                        type: 'bool' },
   { csv: 'ClassCode',           prop: 'class_code',                              type: 'string' },
   { csv: 'TaxIdType',           prop: 'tax_id_type',                             type: 'enumeration' },
   { csv: 'CustRelNum',          prop: 'customer_relationship_number',            type: 'string' },
-  { csv: 'DigBank',             prop: 'digital_banking_flag_yn',                 type: 'bool' },
-  { csv: 'ATMDebitCard',        prop: 'atmdebit_card_yn',                        type: 'bool' },
+  { csv: 'DigBank',             prop: 'digital_banking_flag_yn',                 type: 'bool', coerce: 'yn_to_bool' },
+  { csv: 'ATMDebitCard',        prop: 'atmdebit_card_yn',                        type: 'bool', coerce: 'yn_to_bool' },
   { csv: 'Q2userID',            prop: 'q2_user_id',                              type: 'string' },
-  { csv: 'LastLogin',           prop: 'last_login',                              type: 'date' },
-  { csv: 'RecurTrans',          prop: 'recurring_transactions_yn',               type: 'bool' },
+  { csv: 'LastLogin',           prop: 'last_login',                              type: 'date', coerce: 'date_only' },
+  { csv: 'RecurTrans',          prop: 'recurring_transactions_yn',               type: 'bool', coerce: 'yn_to_bool' },
   { csv: 'StmtType',            prop: 'stmt_type',                               type: 'enumeration' },
-  { csv: 'EnrollmentDt',        prop: 'enrollment_date',                         type: 'date' },
+  { csv: 'EnrollmentDt',        prop: 'enrollment_date',                         type: 'date', coerce: 'date_only' },
   { csv: 'CentralGroupID',      prop: 'central_group_id',                        type: 'string' },
-  { csv: 'TextOptIn',           prop: 'text_opt_in',                             type: 'bool' },
-  // DiscAcpt is a Y/N flag in the source CSV (audited across all 261k rows
-  // — 122k Y/N, 1 stray datetime, 1 free text). HubSpot's only matching
-  // property is `estatement_disclosure_acceptance_date` of type=date — there
-  // is no Y/N analogue. Per user direction, HOLD: preserve in staging
-  // (raw_csv keeps the original value), do not send to HubSpot, surface in
-  // the Data Issues UI panel via mapping_issues.
-  { csv: 'DiscAcpt',            prop: 'estatement_disclosure_acceptance_date',   type: 'date',
-    send: false, holdReason: 'Source CSV is Y/N flag; HubSpot property is date — irreconcilable without schema change' },
+  { csv: 'TextOptIn',           prop: 'text_opt_in',                             type: 'bool', coerce: 'yn_to_bool' },
+  // DiscAcpt: source CSV is Y/N flag, HubSpot's `estatement_disclosure_acceptance_date`
+  // is type=date. The mapping is wrong but per memory rule 7 we DO NOT use `send: false`
+  // — every column attempts a HubSpot write. HubSpot will reject Y/N values for this
+  // date property; rejections surface as `hubspot_record_rejected` per record. Civista
+  // must reconcile this on their side (either change the source format or change the
+  // HubSpot property type). NO `coerce` flag is set: we refuse to invent a date out of
+  // a Y/N value.
+  { csv: 'DiscAcpt',            prop: 'estatement_disclosure_acceptance_date',   type: 'date' },
 ];
 
 // Contact-only properties (don't exist on HubSpot companies).
 const CIF_CONTACT_ONLY = [
   { csv: 'FirstName',   prop: 'firstname',                  type: 'string' },
   { csv: 'LastName',    prop: 'lastname',                   type: 'string' },
-  { csv: 'Birthday',    prop: 'date_of_birth',              type: 'date' },
+  { csv: 'Birthday',    prop: 'date_of_birth',              type: 'date', coerce: 'date_only' },
   { csv: 'Address2',    prop: 'street_address_2',           type: 'string' },
-  { csv: 'PrivBanking', prop: 'private_banking_flag_yn',    type: 'bool' },
-  { csv: 'Minor',       prop: 'minor_flag_yn',              type: 'bool' },
+  { csv: 'PrivBanking', prop: 'private_banking_flag_yn',    type: 'bool', coerce: 'yn_to_bool' },
+  { csv: 'Minor',       prop: 'minor_flag_yn',              type: 'bool', coerce: 'yn_to_bool' },
 ];
 
 // Company-only properties (don't exist on HubSpot contacts).
 const CIF_COMPANY_ONLY = [
   { csv: 'FullName',  prop: 'name',                          type: 'string' },
   { csv: 'NAICSCode', prop: 'naics_code',                    type: 'string' },
-  { csv: 'TM',        prop: 'treasury_management_flag_yn',   type: 'bool' },
+  { csv: 'TM',        prop: 'treasury_management_flag_yn',   type: 'bool', coerce: 'yn_to_bool' },
 ];
 
 const CIF_CONTACT_FIELDS = [...CIF_COMMON, ...CIF_CONTACT_ONLY];
@@ -92,7 +104,7 @@ const DDA_FIELDS = [
   { csv: 'officrcode',    prop: 'officer_name',             type: 'string' },
   { csv: 'acctstatus',    prop: 'deposit_account_status',   type: 'enumeration' },
   { csv: 'promocode',     prop: 'promo_code',               type: 'string' },
-  { csv: 'openonline',    prop: 'opened_online_yn',         type: 'bool' },
+  { csv: 'openonline',    prop: 'opened_online_yn',         type: 'bool', coerce: 'yn_to_bool' },
   // 'relationship' field in CSV has no HubSpot equivalent — intentionally dropped.
 ];
 
@@ -131,7 +143,7 @@ const CD_FIELDS = [
   { csv: 'branchnum',     prop: 'branch_number',            type: 'string' },
   { csv: 'officrcode',    prop: 'officer_name',             type: 'string' },
   { csv: 'acctstatus',    prop: 'time_deposit_status',      type: 'enumeration' },
-  { csv: 'openonline',    prop: 'opened_online_yn',         type: 'bool' },
+  { csv: 'openonline',    prop: 'opened_online_yn',         type: 'bool', coerce: 'yn_to_bool' },
   // 'relationship' dropped.
 ];
 
@@ -145,7 +157,7 @@ const DEBIT_CARDS_FIELDS = [
   { csv: 'Expiredate',       prop: 'expiration_date',                  type: 'date' },
   { csv: 'Lastuseddt',       prop: 'last_used',                        type: 'date' },
   { csv: 'POSLast30Days',    prop: 'pos_trans_count__last_30_day',     type: 'number' },
-  { csv: 'ActivePOS',        prop: 'active_pos',                       type: 'bool' },
+  { csv: 'ActivePOS',        prop: 'active_pos',                       type: 'bool', coerce: 'yn_to_bool' },
   // composite_key is generated (not in CSV) — handled specially in parser.
 ];
 
