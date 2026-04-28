@@ -9,7 +9,7 @@ const { runFullSync } = require('./src/sync/orchestrator');
 const { getHealthStatus } = require('./src/monitoring/health');
 const { startSftpServer } = require('./src/ingestion/sftp-server');
 const { testAuth, uploadFile } = require('./src/sync/sftp-client');
-const { eventStream, installConsoleHook } = require('./src/monitoring/event-stream');
+const { eventStream, installConsoleHook, emitHubspot } = require('./src/monitoring/event-stream');
 const { TABLES, CIF_CONTACT_FIELDS, CIF_COMPANY_FIELDS } = require('./src/transform/hubspot-mapping');
 const { describeError } = require('./src/monitoring/errors');
 const loud = require('./src/monitoring/loud');
@@ -189,9 +189,24 @@ app.get('/api/stream', (req, res) => {
     }
   };
   send({ level: 'info', message: 'SSE log stream connected', at: new Date().toISOString() });
+  // HubSpot wire-log feed — separate SSE event name so the UI renders it
+  // in its own panel ("deterministic API calls for HubSpot as I use this UI").
+  const sendHubspot = (record) => {
+    if (detached) return;
+    try {
+      res.write(`event: hubspot\ndata: ${JSON.stringify(record)}\n\n`);
+    } catch (e) {
+      detach();
+    }
+  };
   eventStream.on('log', send);
-  req.on('close', detach);
-  res.on('error', detach);
+  eventStream.on('hubspot', sendHubspot);
+  const fullDetach = () => {
+    detach();
+    eventStream.off('hubspot', sendHubspot);
+  };
+  req.on('close', fullDetach);
+  res.on('error', fullDetach);
 });
 
 // -------------------- Schema check (live HubSpot + Postgres) --------------------
@@ -250,13 +265,21 @@ app.get('/api/schema-check', async (req, res) => {
 
       // HubSpot properties — must surface failures, not silently treat 401 as "0 properties".
       let hsProps = [];
+      const propPath = `/crm/v3/properties/${o.hsObject}`;
       try {
-        const hsRes = await fetch(`https://api.hubapi.com/crm/v3/properties/${o.hsObject}`, {
+        const startedAt = Date.now();
+        const hsRes = await fetch(`https://api.hubapi.com${propPath}`, {
           headers: { Authorization: `Bearer ${apiKey}` },
         });
         const hsText = await hsRes.text();
         let hsBody = {};
         try { hsBody = JSON.parse(hsText); } catch { hsBody = { raw: hsText }; }
+        emitHubspot({
+          method: 'GET', path: propPath, status: hsRes.status,
+          durationMs: Date.now() - startedAt,
+          response: { results: Array.isArray(hsBody.results) ? hsBody.results.length : undefined, message: hsBody.message },
+          source: 'schema-check',
+        });
         if (!hsRes.ok) {
           const msg = `HubSpot ${hsRes.status} on /properties/${o.hsObject}: ${hsBody.message || hsBody.raw || 'no body'}`;
           console.error(`schema-check[${o.label}] ${msg}`);
@@ -306,8 +329,10 @@ app.get('/api/schema-check', async (req, res) => {
 
       // HubSpot total (search API returns total) — must surface 4xx/5xx, not pretend "—".
       let hsCount = null;
+      const searchPath = `/crm/v3/objects/${o.hsObject}/search`;
       try {
-        const sr = await fetch(`https://api.hubapi.com/crm/v3/objects/${o.hsObject}/search`, {
+        const startedAt = Date.now();
+        const sr = await fetch(`https://api.hubapi.com${searchPath}`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ limit: 1 }),
@@ -315,6 +340,13 @@ app.get('/api/schema-check', async (req, res) => {
         const srText = await sr.text();
         let sb = {};
         try { sb = JSON.parse(srText); } catch { sb = { raw: srText }; }
+        emitHubspot({
+          method: 'POST', path: searchPath, status: sr.status,
+          durationMs: Date.now() - startedAt,
+          body: { limit: 1 },
+          response: { total: sb.total, message: sb.message },
+          source: 'schema-check',
+        });
         if (!sr.ok) {
           const msg = `HubSpot ${sr.status} on search ${o.hsObject}: ${sb.message || sb.raw || 'no body'}`;
           console.error(`schema-check[${o.label}] ${msg}`);

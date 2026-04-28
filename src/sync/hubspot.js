@@ -14,6 +14,7 @@ const {
   coerceEmailForHubSpot,
 } = require('../transform/normalize');
 const loud = require('../monitoring/loud');
+const { emitHubspot } = require('../monitoring/event-stream');
 const { pool } = require('../../db/init');
 
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
@@ -40,21 +41,40 @@ const CUSTOM_OBJECTS_REQUIRING_NAME = new Set([
 
 async function hubspotFetch(path, options = {}) {
   const url = `${HUBSPOT_API_BASE}${path}`;
+  const method = (options.method || 'GET').toUpperCase();
   const headers = {
     'Authorization': `Bearer ${process.env.HUBSPOT_API_KEY}`,
     'Content-Type': 'application/json',
     ...options.headers,
   };
 
+  // Inspect the body shape so the wire-log can surface useful detail
+  // (batch size, idProperty) without leaking PII into the UI feed.
+  let bodyMeta = null;
+  if (options.body) {
+    try {
+      const b = JSON.parse(options.body);
+      bodyMeta = {
+        inputs: Array.isArray(b.inputs) ? b.inputs.length : undefined,
+        idProperty: b.idProperty,
+        properties: Array.isArray(b.properties) ? b.properties.length : undefined,
+        limit: b.limit,
+      };
+    } catch { /* non-JSON body */ }
+  }
+
   let delay = INITIAL_DELAY;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const startedAt = Date.now();
     const res = await fetch(url, { ...options, headers });
 
     if (res.status === 429) {
       if (attempt === MAX_RETRIES) {
         const retryBody = await res.text().catch(() => '');
+        emitHubspot({ method, path, status: 429, durationMs: Date.now() - startedAt, attempt, body: bodyMeta, note: 'rate limited — gave up' });
         throw new Error(`Rate limited after ${MAX_RETRIES} retries on ${path}: ${retryBody}`);
       }
+      emitHubspot({ method, path, status: 429, durationMs: Date.now() - startedAt, attempt, body: bodyMeta, note: `backoff ${delay}ms` });
       console.log(`Rate limited on ${path}, retrying in ${delay}ms (attempt ${attempt + 1})`);
       await new Promise(r => setTimeout(r, delay));
       delay *= 2;
@@ -64,6 +84,19 @@ async function hubspotFetch(path, options = {}) {
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+
+    // Wire-log: every completed call surfaces here with timing + sizes so
+    // the operator can demonstrate to the client exactly what happened.
+    const responseMeta = {
+      results: Array.isArray(parsed?.results) ? parsed.results.length : undefined,
+      total: parsed?.total,
+      message: parsed?.message,
+    };
+    emitHubspot({
+      method, path, status: res.status, durationMs: Date.now() - startedAt,
+      attempt, body: bodyMeta, response: responseMeta,
+    });
+
     return { status: res.status, ok: res.ok, body: parsed };
   }
 }

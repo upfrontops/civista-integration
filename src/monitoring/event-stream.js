@@ -39,4 +39,17 @@ function installConsoleHook() {
   console.error = (...a) => { origError(...a); emit('error', a); };
 }
 
-module.exports = { eventStream, installConsoleHook };
+/**
+ * Emit a HubSpot wire-log event. Subscribers (the UI) get a structured
+ * record of every API call we make so they can demonstrate to the client
+ * exactly what data is moving and where. This is in addition to the
+ * generic 'log' event — the wire feed is its own channel.
+ */
+function emitHubspot(record) {
+  eventStream.emit('hubspot', {
+    at: new Date().toISOString(),
+    ...record,
+  });
+}
+
+module.exports = { eventStream, installConsoleHook, emitHubspot };

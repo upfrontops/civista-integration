@@ -107,6 +107,25 @@
   .hash-pill.ok { background:#0f1f14; border-color:#1f4f2a; color:#3fb950; }
   .hash-pill.pending { background:#1f1f14; border-color:#4e441f; color:var(--warn); }
   .hash-pill b { font-weight:600; }
+
+  /* HubSpot Wire panel — every API call shown in real-time so you can
+     demonstrate to the client exactly what's flowing to HubSpot. */
+  .wire-wrap { background:#010409; border:1px solid var(--border); border-radius:var(--radius); margin: 0 20px 12px 20px; padding: 8px 10px; font-family: var(--font-mono); font-size: 11px; max-height: 300px; overflow-y: auto; }
+  .wire-row { padding: 3px 0; border-bottom: 1px dashed transparent; display:flex; align-items:flex-start; gap:8px; }
+  .wire-row:hover { background:#0d1117; }
+  .wire-time { color:var(--dim); width: 70px; flex-shrink:0; }
+  .wire-method { width: 50px; flex-shrink:0; font-weight:600; }
+  .wire-method.GET { color:#79c0ff; }
+  .wire-method.POST { color:#a5d6ff; }
+  .wire-status { width: 50px; flex-shrink:0; font-weight:600; }
+  .wire-status.s2 { color:#3fb950; }    /* 2xx */
+  .wire-status.s3 { color:#79c0ff; }    /* 3xx */
+  .wire-status.s4 { color:var(--err); } /* 4xx */
+  .wire-status.s5 { color:var(--err); } /* 5xx */
+  .wire-status.s4xx, .wire-status.s5xx { color:var(--err); font-weight:700; }
+  .wire-path { color:var(--fg); flex:1; word-break: break-all; }
+  .wire-meta { color:var(--dim); flex-shrink:0; text-align: right; min-width: 100px; }
+  .wire-clear { font-size:11px; color:var(--dim); cursor:pointer; padding:2px 6px; background:none; border:1px solid var(--border); border-radius:3px; }
 </style>
 </head>
 <body>
@@ -167,6 +186,11 @@
     </div>
   </div>
 
+  <h2>🛰 HubSpot Wire <span style="color:var(--dim); font-weight:400; margin-left:8px; font-size:12px;" id="wire-status">live — every API call</span> <button id="btn-clear-wire" class="wire-clear" style="margin-left:auto;">Clear</button></h2>
+  <div class="wire-wrap" id="wire-wrap">
+    <div style="color:var(--dim); font-size:11px;">No HubSpot calls yet. Try the Schema-Check or Run Full Sync buttons.</div>
+  </div>
+
   <h2>⚠ Data Issues <span style="color:var(--dim); font-weight:400; margin-left:8px; font-size:12px;" id="issues-status">loading...</span></h2>
   <div class="issues-wrap" id="issues-wrap">
     <p style="color:var(--dim); font-size:12px; padding:0 20px;">Loading…</p>
@@ -211,6 +235,9 @@ const $actionStatus = qs('#action-status');
 const $schemaWrap = qs('#schema-wrap');
 const $issuesWrap = qs('#issues-wrap');
 const $issuesStatus = qs('#issues-status');
+const $wireWrap = qs('#wire-wrap');
+const $wireStatus = qs('#wire-status');
+const $btnClearWire = qs('#btn-clear-wire');
 const $cbAutoscroll = qs('#cb-autoscroll');
 const $btnClearLog = qs('#btn-clear-log');
 
@@ -329,12 +356,47 @@ function addLogLine({ level, message, at }) {
 }
 $btnClearLog.addEventListener('click', () => { clear($log); });
 
+// HubSpot Wire — every API call streamed in real time.
+let wireCount = 0;
+function addWireRow(record) {
+  // Initial placeholder hint: wipe it on first real call.
+  if (wireCount === 0) clear($wireWrap);
+  wireCount++;
+  const status = record.status ?? 0;
+  const sclass = status >= 500 ? 's5xx' : status >= 400 ? 's4xx' : status >= 300 ? 's3' : status >= 200 ? 's2' : '';
+  const t = (record.at || new Date().toISOString()).split('T')[1].slice(0, 8);
+  const meta = [];
+  if (record.body && record.body.inputs != null) meta.push(record.body.inputs + ' in');
+  if (record.response && record.response.results != null) meta.push(record.response.results + ' out');
+  if (record.response && record.response.total != null) meta.push('total=' + record.response.total);
+  if (record.durationMs != null) meta.push(record.durationMs + 'ms');
+  if (record.note) meta.push(record.note);
+  const row = el('div', { className: 'wire-row' },
+    el('span', { className: 'wire-time' }, t),
+    el('span', { className: 'wire-method ' + (record.method || '') }, record.method || ''),
+    el('span', { className: 'wire-status ' + sclass }, String(status || '—')),
+    el('span', { className: 'wire-path' }, record.path || ''),
+    el('span', { className: 'wire-meta' }, meta.join(' · ')),
+  );
+  $wireWrap.appendChild(row);
+  $wireWrap.scrollTop = $wireWrap.scrollHeight;
+  $wireStatus.textContent = wireCount + ' call' + (wireCount === 1 ? '' : 's');
+}
+$btnClearWire.addEventListener('click', () => {
+  clear($wireWrap);
+  wireCount = 0;
+  $wireStatus.textContent = 'cleared';
+});
+
 function startStream() {
   const es = new EventSource('/api/stream');
   es.onopen  = () => { $logStatus.textContent = '● connected'; $logStatus.style.color = 'var(--ok)'; };
   es.onerror = () => { $logStatus.textContent = '● reconnecting'; $logStatus.style.color = 'var(--warn)'; };
   es.addEventListener('log', (ev) => {
     try { addLogLine(JSON.parse(ev.data)); } catch { addLogLine({ level:'info', message: ev.data }); }
+  });
+  es.addEventListener('hubspot', (ev) => {
+    try { addWireRow(JSON.parse(ev.data)); } catch (e) { /* ignore malformed */ }
   });
 }
 startStream();
