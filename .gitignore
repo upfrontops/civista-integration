@@ -10,3 +10,4 @@ validate.sh
 *.csv
 *.vtt
 scripts/__pycache__/
+civista-railway-env.json
