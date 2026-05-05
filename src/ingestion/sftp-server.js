@@ -53,6 +53,20 @@ function startSftpServer(options = {}) {
     return null;
   }
 
+  // Refuse to start if SFTP_PORT collides with the HTTP port. Otherwise we
+  // crash later with EADDRINUSE and Railway kills the deploy with no
+  // informative message. Surface the conflict at the right place.
+  const httpPort = parseInt(process.env.PORT || '3000', 10);
+  if (port === httpPort) {
+    console.error('╔════════════════════════════════════════════════════════════════╗');
+    console.error('║  SFTP server NOT started: SFTP_PORT === PORT                  ║');
+    console.error(`║  Both want :${port}. Set PORT to a different value (Railway`);
+    console.error('║  default is 8080) or set SFTP_PORT to something other than    ║');
+    console.error(`║  ${port}. Common fix: remove PORT env var so Railway auto-sets it.║`);
+    console.error('╚════════════════════════════════════════════════════════════════╝');
+    return null;
+  }
+
   fs.mkdirSync(incomingDir, { recursive: true });
 
   const hostKey = key.buffer;
