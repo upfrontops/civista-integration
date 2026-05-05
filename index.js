@@ -162,22 +162,33 @@ app.get('/api/info', (req, res) => {
   });
 });
 
+// Track boot time so /health can offer a startup grace period. During the
+// first STARTUP_GRACE_MS after process start, /health returns 200 even if
+// the DB is briefly unreachable (which happens during Railway redeploys
+// when Postgres is reconnecting). After the grace window, /health flips
+// to fail-fast 503 so Railway recycles the service if the DB really is
+// dead. Without this, the rolling-redeploy window of DB churn was killing
+// every new deploy.
+const PROCESS_BOOT_AT = Date.now();
+const STARTUP_GRACE_MS = 60_000;
+
 app.get('/health', async (req, res) => {
-  // Race the DB-backed health query against a 2s timeout. If we go past
-  // that, return 503 — Railway's healthcheck will mark the service
-  // unhealthy and restart it (per Q14: fail healthcheck if DB down).
-  // Without this, pool.connect() can hang indefinitely when Postgres is
-  // unreachable (Railway-reported bug).
+  const inGrace = (Date.now() - PROCESS_BOOT_AT) < STARTUP_GRACE_MS;
+  // Race the DB-backed health query against a 2s timeout.
   const timeoutMs = 2000;
-  let timed = false;
-  const timer = new Promise((resolve) => setTimeout(() => { timed = true; resolve({ status: 'unhealthy', database: 'unreachable', error: `health check timed out after ${timeoutMs}ms` }); }, timeoutMs));
+  const timer = new Promise((resolve) => setTimeout(() => resolve({ status: 'unhealthy', database: 'unreachable', error: `health check timed out after ${timeoutMs}ms` }), timeoutMs));
+  let status;
   try {
-    const status = await Promise.race([getHealthStatus(), timer]);
-    if (status && status.database === 'connected') return res.status(200).json(status);
-    return res.status(503).json(status || { status: 'unhealthy', database: 'unknown' });
+    status = await Promise.race([getHealthStatus(), timer]);
   } catch (err) {
-    return res.status(503).json({ status: 'unhealthy', database: 'unreachable', error: describeError(err) });
+    status = { status: 'unhealthy', database: 'unreachable', error: describeError(err) };
   }
+  if (status && status.database === 'connected') return res.status(200).json(status);
+  if (inGrace) {
+    // Don't fail healthcheck during boot. Tell Railway we're starting.
+    return res.status(200).json({ ...status, status: 'starting', database: 'starting', grace_remaining_ms: STARTUP_GRACE_MS - (Date.now() - PROCESS_BOOT_AT) });
+  }
+  return res.status(503).json(status || { status: 'unhealthy', database: 'unknown' });
 });
 
 // -------------------- Sync --------------------
