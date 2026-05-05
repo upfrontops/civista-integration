@@ -176,6 +176,14 @@ Each test has: ID, what, how, expected, actual (filled by harness), status (PASS
 | Steps | 1. Inspect Railway logs at boot for `Cron: starting nightly sync` skip messages on prior boots, OR 2. Verify `index.js` cron block is present in deployed code via SSH `cat /app/index.js | grep -A3 "cron.schedule"`. |
 | Pass | Cron registered; handler refuses to run if `portalGuardOk === false`. |
 
+### T14. UI basic auth enforced (automated)
+
+| Item | Detail |
+|---|---|
+| Why | Bank-grade. Every UI and API route except `/health` requires HTTP Basic auth using `SFTP_USER` and `SFTP_PASS`. The password never appears in front-end code. The browser's native auth dialog handles the prompt. |
+| Steps | 1. `GET /api/info` with no Authorization header. Expect HTTP 401 plus `WWW-Authenticate: Basic` response header. 2. `GET /api/info` with `Authorization: Basic <base64('wrong:wrong')>`. Expect 401. 3. `GET /health` with no Authorization header. Expect 200 (Railway's healthcheck must not be auth-gated). 4. (Implicit through every other test.) The harness's `http()` helper auto-attaches `Authorization: Basic <base64('SFTP_USER:SFTP_PASS')>` on every request, so all other tests passing implies correct credentials are accepted. |
+| Pass | Steps 1, 2, 3 all behave as expected. Comparison is constant-time (SHA-256 digest plus `crypto.timingSafeEqual`), and failed attempts surface as `ui_basic_auth_rejected` warnings in `sync_errors`. |
+
 ### T13. Operator UI walkthrough (manual)
 
 | Item | Detail |
@@ -187,7 +195,7 @@ Each test has: ID, what, how, expected, actual (filled by harness), status (PASS
 
 ## 6. Pass criteria
 
-UAT passes if and only if every test T1 through T13 has status PASS. There are no soft fails.
+UAT passes if and only if every test T1 through T14 has status PASS. There are no soft fails.
 
 A test marked DEFERRED (T11 Pass B is the only candidate) requires explicit operator sign-off in §8 with the reason and the planned re-test date.
 
@@ -243,6 +251,7 @@ The harness writes its results to `uat-results.md` (in the working directory). P
 | T11 | Feature flag doesn't disable surface. | Code regression in `index.js` route guards. |
 | T12 | Cron block not in deployed code. | Old commit deployed. |
 | T13 | UI panel error or missing element. | Browser console error usually points at the failing fetch; cross-check the corresponding `/api/...` route. |
+| T14 | Basic auth not enforced, or `/health` is gated. | Confirm `SFTP_USER` and `SFTP_PASS` env vars are set on Railway. Confirm the `app.use(basicAuth)` middleware is registered before the route handlers in `index.js`. `/health` short-circuit must remain before the auth check. |
 
 ## 10. Results (filled by harness)
 

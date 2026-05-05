@@ -49,7 +49,15 @@ function record(id, name, status, detail, startedAt) {
 
 async function http(method, pathOrUrl, opts = {}) {
   const url = pathOrUrl.startsWith('http') ? pathOrUrl : cfg.RAILWAY_URL + pathOrUrl;
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  // Auto-attach Basic auth on every request (Civista UI is bank-grade
+  // protected with SFTP_USER:SFTP_PASS as the realm credentials). /health
+  // is unauthenticated server-side so the header is harmless there.
+  const basic = Buffer.from(`${cfg.SFTP_USER}:${cfg.SFTP_PASS}`).toString('base64');
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Basic ${basic}`,
+    ...(opts.headers || {}),
+  };
   const res = await fetch(url, { method, headers, body: opts.body });
   const text = await res.text();
   let body = null;
@@ -316,6 +324,35 @@ async function T12_cron() {
   record('T12', 'Cron schedule registration', 'DEFERRED', 'Manual inspection: SSH and grep /app/index.js for cron.schedule block', 0);
 }
 
+async function T14_basicAuth() {
+  // Bypass our auto-auth wrapper to verify the gate is actually present.
+  const t0 = Date.now();
+  try {
+    const noAuth = await fetch(cfg.RAILWAY_URL + '/api/info');
+    if (noAuth.status !== 401) {
+      return record('T14', 'UI basic auth enforced', 'FAIL', `unauthenticated /api/info returned ${noAuth.status}, expected 401 (auth gate not active)`, t0);
+    }
+    const wwwAuth = noAuth.headers.get('www-authenticate') || '';
+    if (!wwwAuth.toLowerCase().startsWith('basic')) {
+      return record('T14', 'UI basic auth enforced', 'FAIL', `WWW-Authenticate header missing or wrong scheme: "${wwwAuth}"`, t0);
+    }
+    const wrongAuth = await fetch(cfg.RAILWAY_URL + '/api/info', {
+      headers: { Authorization: 'Basic ' + Buffer.from('wrong:wrong').toString('base64') },
+    });
+    if (wrongAuth.status !== 401) {
+      return record('T14', 'UI basic auth enforced', 'FAIL', `wrong-creds /api/info returned ${wrongAuth.status}, expected 401`, t0);
+    }
+    // Confirm /health is exempt (Railway's probe must not be auth-gated).
+    const health = await fetch(cfg.RAILWAY_URL + '/health');
+    if (health.status === 401) {
+      return record('T14', 'UI basic auth enforced', 'FAIL', '/health is auth-gated; Railway healthcheck cannot probe it', t0);
+    }
+    record('T14', 'UI basic auth enforced', 'PASS', 'no-auth=401 (Basic challenge), wrong-creds=401, /health bypassed', t0);
+  } catch (e) {
+    record('T14', 'UI basic auth enforced', 'FAIL', e.message, t0);
+  }
+}
+
 // ─── runner ────────────────────────────────────────────────────────
 
 async function main() {
@@ -332,6 +369,7 @@ async function main() {
   await T10_idempotence();
   await T11_featureFlags();
   await T12_cron();
+  await T14_basicAuth();
 
   // Write markdown summary
   const passes = results.filter(r => r.status === 'PASS').length;

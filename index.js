@@ -75,6 +75,69 @@ const upload = multer({ dest: TMP_UPLOAD_DIR });
 
 app.use(express.json());
 
+// Bank-grade HTTP Basic auth on every route except /health.
+//
+// Credentials match SFTP_USER + SFTP_PASS (per user direction: same creds
+// for UI and SFTP to keep operator memory simple). The password never
+// appears in the front-end code; the browser handles Basic auth natively
+// via the WWW-Authenticate prompt.
+//
+// Comparison uses crypto.timingSafeEqual on SHA-256 digests of both the
+// expected and given values. SHA-256 outputs are always 32 bytes, so the
+// equal-length precondition holds regardless of input length and we don't
+// leak password length via timing.
+//
+// Failed attempts are loud-surfaced with the offending IP so brute-force
+// attempts show up in /api/issues.
+const crypto = require('crypto');
+function digestForCompare(s) {
+  return crypto.createHash('sha256').update(String(s || ''), 'utf8').digest();
+}
+const EXPECTED_USER_DIGEST = digestForCompare(process.env.SFTP_USER || '');
+const EXPECTED_PASS_DIGEST = digestForCompare(process.env.SFTP_PASS || '');
+const HAS_AUTH_CREDS = !!(process.env.SFTP_USER && process.env.SFTP_PASS);
+
+app.use((req, res, next) => {
+  // /health must remain unauthenticated for Railway healthcheck.
+  if (req.path === '/health') return next();
+  // If creds aren't configured we fail closed: 503 with a loud alarm.
+  if (!HAS_AUTH_CREDS) {
+    loud.alarm({
+      event: 'ui_auth_misconfigured',
+      message: 'SFTP_USER or SFTP_PASS not set; refusing all UI/API requests',
+      context: { path: req.path },
+    }).catch(() => {});
+    return res.status(503).send('Service auth misconfigured');
+  }
+  const header = req.get('Authorization') || '';
+  if (!header.startsWith('Basic ')) {
+    res.set('WWW-Authenticate', 'Basic realm="civista-integration", charset="UTF-8"');
+    return res.status(401).send('Authentication required');
+  }
+  let user = '', pass = '';
+  try {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    const idx = decoded.indexOf(':');
+    if (idx >= 0) {
+      user = decoded.slice(0, idx);
+      pass = decoded.slice(idx + 1);
+    }
+  } catch (_) { /* malformed header */ }
+
+  const userOk = crypto.timingSafeEqual(digestForCompare(user), EXPECTED_USER_DIGEST);
+  const passOk = crypto.timingSafeEqual(digestForCompare(pass), EXPECTED_PASS_DIGEST);
+  if (!userOk || !passOk) {
+    loud.warn({
+      event: 'ui_basic_auth_rejected',
+      message: `UI basic auth rejected for user="${user.slice(0, 24)}"`,
+      context: { ip: req.ip || req.socket.remoteAddress, path: req.path },
+    }).catch(() => {});
+    res.set('WWW-Authenticate', 'Basic realm="civista-integration", charset="UTF-8"');
+    return res.status(401).send('Invalid credentials');
+  }
+  next();
+});
+
 // Static assets for the debug UI — only when ENABLE_DEBUG_UI=1.
 // When the flag is off, GET / and any /index.html etc. return 404 so the
 // service is API-only in prod by default.
@@ -335,7 +398,20 @@ app.get('/api/schema-check', async (req, res) => {
         continue;
       }
       const pgColSet = new Set(pgCols.rows.map(r => r.column_name));
-      const internal = new Set(['id', 'row_hash', 'loaded_at', 'synced_at']);
+      // Internal columns we never expect to find on the HubSpot side.
+      // Includes the audit columns added in the railway-only refactor:
+      // raw_csv (verbatim source), db_persist_hash + db_verified_at
+      // (HASH B), hubspot_persist_hash + hubspot_verified_at +
+      // hubspot_verify_diff (HASH C), needs_review (mismatch flag),
+      // coercions (transformation audit). All staging-only.
+      const internal = new Set([
+        'id', 'row_hash', 'loaded_at', 'synced_at',
+        'raw_csv',
+        'db_persist_hash', 'db_verified_at',
+        'hubspot_persist_hash', 'hubspot_verified_at', 'hubspot_verify_diff',
+        'needs_review',
+        'coercions',
+      ]);
 
       // HubSpot properties — must surface failures, not silently treat 401 as "0 properties".
       let hsProps = [];
