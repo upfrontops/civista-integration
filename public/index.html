@@ -169,6 +169,9 @@
     <h2>③ Run</h2>
     <button id="btn-sync" class="secondary">Run Full Sync</button>
     <button id="btn-schema-refresh" class="secondary">Refresh Schema Check</button>
+    <hr style="border:0; border-top:1px solid var(--border); margin:14px 0;">
+    <button id="btn-reset" style="background:#5d1a1a; color:#fff; border:1px solid #7a2929;">🔄 Reset for demo</button>
+    <div style="color:var(--dim); font-size:11px; margin-top:6px;">Wipes Postgres staging, archives every HubSpot record in the 6 sandbox objects, clears /incoming, /archive, /quarantine. Requires <code>ENABLE_DEMO_RESET=1</code> on the server.</div>
     <div id="action-status" class="status">Idle.</div>
   </section>
 
@@ -233,7 +236,8 @@ const $host = qs('#sftp-host'), $port = qs('#sftp-port'),
 const $authStatus = qs('#auth-status');
 const $panelUpload = qs('#panel-upload'), $panelActions = qs('#panel-actions');
 const $btnConnect = qs('#btn-connect'), $btnUpload = qs('#btn-upload'),
-      $btnSync = qs('#btn-sync'), $btnSchemaRefresh = qs('#btn-schema-refresh');
+      $btnSync = qs('#btn-sync'), $btnSchemaRefresh = qs('#btn-schema-refresh'),
+      $btnReset = qs('#btn-reset');
 const $filePicker = qs('#file-picker'), $fileList = qs('#file-list');
 const $log = qs('#log'), $logStatus = qs('#log-status');
 const $actionStatus = qs('#action-status');
@@ -352,6 +356,37 @@ $btnSync.addEventListener('click', async () => {
   }
 });
 $btnSchemaRefresh.addEventListener('click', () => { loadSchemaCheck(); loadIssues(); });
+
+$btnReset.addEventListener('click', async () => {
+  const confirmed = confirm(
+    'RESET FOR DEMO\n\n' +
+    'This will:\n' +
+    '  • TRUNCATE every Postgres staging + ledger table\n' +
+    '  • ARCHIVE every record in the 6 HubSpot objects (contacts, companies, deposits, loans, time_deposits, debit_cards)\n' +
+    '  • DELETE everything in /incoming, /archive, /quarantine\n\n' +
+    'Use this only on the sandbox portal. NOT reversible.\n\n' +
+    'Continue?'
+  );
+  if (!confirmed) return;
+  $btnReset.disabled = true;
+  setStatus($actionStatus, 'Resetting…', 'info');
+  try {
+    const res = await fetch('/api/demo-reset', { method: 'POST' });
+    const body = await res.json();
+    if (!res.ok) {
+      setStatus($actionStatus, '✗ reset failed: ' + (body.error || res.status), 'err');
+    } else {
+      const hsArchived = Object.values(body.result.hubspot || {}).reduce((a,b) => a + (b||0), 0);
+      setStatus($actionStatus, `✓ reset complete · ${hsArchived} HubSpot records archived`, 'ok');
+      // Refresh all panels
+      setTimeout(() => { loadIssues(); loadCoercions(); }, 500);
+    }
+  } catch (e) {
+    setStatus($actionStatus, '✗ ' + e.message, 'err');
+  } finally {
+    $btnReset.disabled = false;
+  }
+});
 
 function addLogLine({ level, message, at }) {
   const row = el('div', { className: level || 'info' },

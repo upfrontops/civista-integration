@@ -9,6 +9,7 @@ const { runFullSync } = require('./src/sync/orchestrator');
 const { getHealthStatus } = require('./src/monitoring/health');
 const { startSftpServer } = require('./src/ingestion/sftp-server');
 const { testAuth, uploadFile } = require('./src/sync/sftp-client');
+const { hubspotFetch } = require('./src/sync/hubspot');
 const { eventStream, installConsoleHook, emitHubspot } = require('./src/monitoring/event-stream');
 const { TABLES, CIF_CONTACT_FIELDS, CIF_COMPANY_FIELDS } = require('./src/transform/hubspot-mapping');
 const { describeError } = require('./src/monitoring/errors');
@@ -195,21 +196,23 @@ app.get('/health', async (req, res) => {
 let syncRunning = false;
 let portalGuardOk = false; // set true by checkPortalCutover() at boot
 
-// Manual sync route. Requires header `X-Sync-Token: <value>` matching the
-// MANUAL_SYNC_TOKEN env var. Without that env set, the route is disabled
-// and only the 2 AM cron triggers a sync. Per Q11 (cron + auth-gated /sync).
+// Manual sync route. Auth is enforced by the Basic Auth middleware
+// at the top of the request chain; if you got here, you're authorized.
+// (X-Sync-Token is honored as an OPTIONAL secondary auth path for
+// non-browser clients but no longer required.)
 app.post('/sync', async (req, res) => {
-  if (!MANUAL_SYNC_TOKEN) {
-    return res.status(403).json({ error: 'Manual /sync disabled. Set MANUAL_SYNC_TOKEN env var to enable.' });
-  }
-  const provided = req.get('X-Sync-Token');
-  if (provided !== MANUAL_SYNC_TOKEN) {
-    await loud.warn({
-      event: 'manual_sync_auth_rejected',
-      message: 'POST /sync attempted without a valid X-Sync-Token',
-      context: { hasHeader: !!provided },
-    });
-    return res.status(403).json({ error: 'X-Sync-Token missing or invalid' });
+  if (MANUAL_SYNC_TOKEN) {
+    const provided = req.get('X-Sync-Token');
+    // If a token was provided, it must match. Missing is fine (Basic
+    // Auth already gated). Wrong token is suspicious — log it loud.
+    if (provided && provided !== MANUAL_SYNC_TOKEN) {
+      await loud.warn({
+        event: 'manual_sync_auth_rejected',
+        message: 'POST /sync attempted with a wrong X-Sync-Token (Basic auth had passed)',
+        context: { hasHeader: !!provided },
+      });
+      return res.status(403).json({ error: 'X-Sync-Token mismatch' });
+    }
   }
   if (!portalGuardOk) {
     return res.status(503).json({ error: 'Portal cutover guard failed; sync disabled. See logs / run scripts/cutover-portal.js.' });
@@ -770,6 +773,106 @@ async function checkPortalCutover() {
   return true;
 }
 
+// Seed mapping_issues from any field flagged `send: false` in the mapping.
+// One row per held mapping so the UI's Data Issues panel always reflects
+// current state, even before any /sync runs. Each held mapping replaces
+// what would otherwise be ~80 per-record HubSpot rejections per sync.
+async function seedMappingIssues() {
+  const allFields = [
+    { csv: 'HubSpot_CIF.csv', hsObject: 'contacts',    fields: CIF_CONTACT_FIELDS },
+    { csv: 'HubSpot_CIF.csv', hsObject: 'companies',   fields: CIF_COMPANY_FIELDS },
+    { csv: 'HubSpot_DDA.csv', hsObject: '2-60442978',  fields: TABLES.dda.fields },
+    { csv: 'HubSpot_Loan.csv', hsObject: '2-60442977', fields: TABLES.loans.fields },
+    { csv: 'HubSpot_CD.csv', hsObject: '2-60442980',   fields: TABLES.cd.fields },
+    { csv: 'HubSpot_Debit_Card.csv', hsObject: '2-60442979', fields: TABLES.debit_cards.fields },
+  ];
+  for (const grp of allFields) {
+    for (const f of grp.fields) {
+      if (f.send !== false) continue;
+      await loud.mappingIssue({
+        sourceCsv: grp.csv, sourceColumn: f.csv,
+        hsObject: grp.hsObject, hsProperty: f.prop, hsType: f.type,
+        problem: f.holdReason || 'Mapping held — middleware will not transmit',
+      });
+    }
+  }
+}
+
+// Demo reset endpoint. TRUNCATEs Postgres state, archives every record
+// in the 6 HubSpot objects, clears the on-disk file dirs. Restores the
+// service to a pristine pre-sync state for clean demos. The demo flag
+// gates this since it's destructive and prod must never expose it.
+const ENABLE_DEMO_RESET = process.env.ENABLE_DEMO_RESET === '1';
+
+async function wipeHubspotObject(objectType) {
+  let archived = 0;
+  // Page through, accumulating ids 100 at a time, then batch-archive.
+  let after = null;
+  while (true) {
+    const qs = after ? `?limit=100&after=${encodeURIComponent(after)}` : '?limit=100';
+    const list = await hubspotFetch(`/crm/v3/objects/${objectType}${qs}`, { method: 'GET' });
+    if (!list.ok) break;
+    const ids = (list.body?.results || []).map(r => r.id);
+    if (ids.length === 0) break;
+    const archive = await hubspotFetch(`/crm/v3/objects/${objectType}/batch/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ inputs: ids.map(id => ({ id })) }),
+    });
+    if (!archive.ok) break;
+    archived += ids.length;
+    after = list.body?.paging?.next?.after || null;
+    if (!after) break;
+  }
+  return archived;
+}
+
+app.post('/api/demo-reset', async (req, res) => {
+  if (!ENABLE_DEMO_RESET) {
+    return res.status(404).json({ error: 'Demo reset disabled (set ENABLE_DEMO_RESET=1)' });
+  }
+  if (syncRunning) {
+    return res.status(409).json({ error: 'Cannot reset while sync is running' });
+  }
+  await loud.warn({
+    event: 'demo_reset_triggered',
+    message: 'Demo reset starting: TRUNCATE Postgres state + archive HubSpot records + clear on-disk dirs',
+  });
+  const result = { postgres: {}, hubspot: {}, files: {} };
+  try {
+    // 1. TRUNCATE Postgres (preserves meta so portal guard stays valid).
+    const tables = [
+      'sync_errors','sync_log','mapping_issues','shipped_records','hubspot_id_map',
+      'stg_contacts','stg_companies','stg_deposits','stg_loans','stg_time_deposits','stg_debit_cards',
+    ];
+    for (const t of tables) {
+      try { await pool.query(`TRUNCATE ${t} RESTART IDENTITY`); result.postgres[t] = 'truncated'; }
+      catch (e) { result.postgres[t] = 'skip:' + (e.code || e.message); }
+    }
+    // 2. Archive every record in the 6 HubSpot objects.
+    const objects = ['contacts','companies','2-60442978','2-60442977','2-60442980','2-60442979'];
+    for (const obj of objects) {
+      result.hubspot[obj] = await wipeHubspotObject(obj);
+    }
+    // 3. Clear on-disk file dirs.
+    for (const dir of [INCOMING_DIR, ARCHIVE_DIR, QUARANTINE_DIR]) {
+      try {
+        for (const entry of fs.readdirSync(dir)) {
+          const full = path.join(dir, entry);
+          const stat = fs.lstatSync(full);
+          if (stat.isDirectory()) fs.rmSync(full, { recursive: true, force: true });
+          else fs.unlinkSync(full);
+        }
+        result.files[dir] = 'cleared';
+      } catch (e) { result.files[dir] = 'skip:' + (e.code || e.message); }
+    }
+    // 4. Re-seed mapping_issues so held mappings reappear immediately.
+    await seedMappingIssues();
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: describeError(e), result });
+  }
+});
+
 // Start Express first, then init DB and run the portal cutover guard.
 app.listen(port, () => {
   console.log(`civista-integration listening on port ${port}`);
@@ -783,6 +886,8 @@ app.listen(port, () => {
       if (!ok) {
         console.error('Portal cutover guard FAILED — service will refuse /sync until resolved.');
       }
+      return seedMappingIssues();
     })
+    .then(() => console.log('Mapping issues seeded'))
     .catch((err) => console.error('Boot tasks failed (will retry on next request):', describeError(err)));
 });

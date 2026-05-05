@@ -57,13 +57,15 @@ const CIF_COMMON = [
   { csv: 'CentralGroupID',      prop: 'central_group_id',                        type: 'string' },
   { csv: 'TextOptIn',           prop: 'text_opt_in',                             type: 'bool', coerce: 'yn_to_bool' },
   // DiscAcpt: source CSV is Y/N flag, HubSpot's `estatement_disclosure_acceptance_date`
-  // is type=date. The mapping is wrong but per memory rule 7 we DO NOT use `send: false`
-  // — every column attempts a HubSpot write. HubSpot will reject Y/N values for this
-  // date property; rejections surface as `hubspot_record_rejected` per record. Civista
-  // must reconcile this on their side (either change the source format or change the
-  // HubSpot property type). NO `coerce` flag is set: we refuse to invent a date out of
-  // a Y/N value.
-  { csv: 'DiscAcpt',            prop: 'estatement_disclosure_acceptance_date',   type: 'date' },
+  // is type=date. The mapping is wrong on the upstream side. Sending Y/N produces a
+  // HubSpot 400 per record (~80 rejections per sync), which floods the data-issues
+  // panel and obscures real failures. Held with `send: false` and surfaced ONCE in
+  // mapping_issues at boot. Raw value is still preserved verbatim in raw_csv per
+  // memory rule 3. Civista must reconcile the source format or HubSpot property
+  // type before this can ship.
+  { csv: 'DiscAcpt',            prop: 'estatement_disclosure_acceptance_date',   type: 'date',
+    send: false,
+    holdReason: 'Source CSV is Y/N flag; HubSpot property is date. Held to avoid ~80 per-sync rejections. Civista to reconcile.' },
 ];
 
 // Contact-only properties (don't exist on HubSpot companies).

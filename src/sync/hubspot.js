@@ -137,6 +137,10 @@ function buildPayload(row, fields) {
     const { csv, prop, type } = f;
     const raw = row[prop];
 
+    // Held mapping (`send: false`). Field is preserved in raw_csv per
+    // rule 3 but not transmitted. Surfaced once in mapping_issues at boot.
+    if (f.send === false) continue;
+
     // Empty / null → omit from payload entirely (HubSpot treats absent props as no-change).
     if (raw === null || raw === undefined || raw === '') continue;
 
